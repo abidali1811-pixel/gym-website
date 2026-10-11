@@ -1,0 +1,656 @@
+"""Small SQLite-backed web server for the IronPulse contact form and admin page."""
+
+from datetime import datetime, timedelta, timezone
+from http import cookies
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import sqlite3
+import time
+
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(ROOT, "visits.sqlite3")
+
+
+def load_local_env():
+    env_path = os.path.join(ROOT, ".env")
+    try:
+        with open(env_path, encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                if name.strip() and name.strip() not in os.environ:
+                    os.environ[name.strip()] = value
+    except FileNotFoundError:
+        pass
+
+
+load_local_env()
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-astra")
+CHAT_PROVIDER = os.environ.get("CHAT_PROVIDER", "gemini").strip().lower()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+CHATBOT_KNOWLEDGE = os.path.join(ROOT, "chatbot_knowledge.json")
+SESSION_LIFETIME = timedelta(hours=12)
+
+
+def initialize_database():
+    with sqlite3.connect(DATABASE) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS visits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS membership_plans (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                price TEXT NOT NULL,
+                featured INTEGER NOT NULL DEFAULT 0,
+                feature1 TEXT NOT NULL,
+                feature2 TEXT NOT NULL,
+                feature3 TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS membership_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                title TEXT NOT NULL,
+                description TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS home_banner (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                eyebrow TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                button_label TEXT NOT NULL,
+                button_url TEXT NOT NULL,
+                image_url TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        db.execute(
+            "INSERT OR IGNORE INTO membership_settings (id, title, description) VALUES (1, ?, ?)",
+            ("Memberships", "Simple plans. Cancel anytime on monthly options."),
+        )
+        defaults = [
+            (1, "Basic", "29", 0, "Gym floor access", "Locker room", "1 guest pass / month"),
+            (2, "Pro", "49", 1, "Everything in Basic", "Unlimited group classes", "Monthly body scan"),
+            (3, "Elite", "89", 0, "Everything in Pro", "4 PT sessions / month", "Sauna & recovery lounge"),
+        ]
+        db.executemany(
+            "INSERT OR IGNORE INTO membership_plans "
+            "(id, name, price, featured, feature1, feature2, feature3) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            defaults,
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO home_banner "
+            "(id, eyebrow, title, description, button_label, button_url, image_url) VALUES (1, ?, ?, ?, ?, ?, ?)",
+            ("Train harder. Live stronger.", "Your goals.\nOur floor.", "Morning gym hours: 6:00 AM–10:00 AM; evening hours: 6:00 PM–10:00 PM. Expert coaches and a community that keeps you accountable.", "View memberships", "#pricing", ""),
+        )
+        db.execute(
+            "UPDATE home_banner SET description = ? WHERE id = 1 AND description = ?",
+            (
+                "Morning gym hours: 6:00 AM–10:00 AM; evening hours: 6:00 PM–10:00 PM. Expert coaches and a community that keeps you accountable.",
+                "24/7 access, expert coaches, and a community that keeps you accountable.",
+            ),
+        )
+
+
+def signed_session(timestamp):
+    signature = hmac.new(SESSION_SECRET.encode(), timestamp.encode(), hashlib.sha256).hexdigest()
+    return f"{timestamp}.{signature}"
+
+
+class WebsiteHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/admin":
+            if self.is_admin():
+                self.show_admin()
+            else:
+                self.show_login()
+            return
+        if path == "/admin/logout":
+            self.redirect("/admin")
+            return
+        if path in ("/", "/index.html"):
+            self.serve_home()
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/submit":
+            self.save_visit()
+        elif path == "/admin/login":
+            self.login()
+        elif path == "/admin/memberships":
+            if self.is_admin():
+                self.save_memberships()
+            else:
+                self.send_error(403, "Please sign in to edit memberships")
+        elif path == "/admin/banner":
+            if self.is_admin():
+                self.save_banner()
+            else:
+                self.send_error(403, "Please sign in to edit the banner")
+        elif path == "/api/chat":
+            self.chat_reply()
+        elif path == "/admin/logout":
+            self.send_response(303)
+            self.send_header("Set-Cookie", "admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.send_header("Location", "/admin")
+            self.end_headers()
+        else:
+            self.send_error(404)
+
+    def read_form(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length < 0 or length > 16_384:
+            return None
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        return parse_qs(body, keep_blank_values=True)
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0 or length > 24_000:
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def respond_json(self, payload, status=200):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def chat_reply(self):
+        if CHAT_PROVIDER == "gemini" and not GEMINI_API_KEY:
+            self.respond_json({"error": "The chatbot is not configured yet. Add GEMINI_API_KEY to the .env file and restart the server."}, status=503)
+            return
+        if CHAT_PROVIDER == "openai" and not OPENAI_API_KEY:
+            self.respond_json({"error": "The chatbot is not configured yet. Add OPENAI_API_KEY to the .env file and restart the server."}, status=503)
+            return
+        if CHAT_PROVIDER not in ("gemini", "openai"):
+            self.respond_json({"error": "CHAT_PROVIDER must be set to gemini or openai in the .env file."}, status=503)
+            return
+        payload = self.read_json()
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list) or not 1 <= len(messages) <= 12:
+            self.respond_json({"error": "Send up to 12 chat messages."}, status=400)
+            return
+        history = []
+        for item in messages:
+            if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+                self.respond_json({"error": "Invalid chat message."}, status=400)
+                return
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip() or len(content) > 1200:
+                self.respond_json({"error": "Each message must contain 1 to 1200 characters."}, status=400)
+                return
+            history.append({"role": item["role"], "content": content.strip()})
+        if history[-1]["role"] != "user":
+            self.respond_json({"error": "The latest message must be from the visitor."}, status=400)
+            return
+        try:
+            with open(CHATBOT_KNOWLEDGE, encoding="utf-8") as knowledge_file:
+                facts = json.load(knowledge_file)
+            with sqlite3.connect(DATABASE) as db:
+                db.row_factory = sqlite3.Row
+                plans = db.execute("SELECT name, price, feature1, feature2, feature3 FROM membership_plans ORDER BY id").fetchall()
+            facts["current_memberships"] = [
+                {"name": plan["name"], "monthly_price_inr": plan["price"], "features": [plan[f"feature{number}"] for number in (1, 2, 3)]}
+                for plan in plans
+            ]
+            facts["membership_currency"] = "INR (Indian rupees)"
+        except (OSError, json.JSONDecodeError, sqlite3.Error):
+            self.respond_json({"error": "The gym information file could not be loaded. Please contact the gym directly."}, status=500)
+            return
+        instructions = (
+            "You are the IronPulse Fitness website assistant. Be friendly, concise, and answer only using the gym facts below plus general, non-medical fitness knowledge. "
+            "Use the current membership data and class schedule when asked about plans or times. All membership prices are in Indian rupees (INR); show them with the ₹ symbol and never convert currencies. Never invent prices, schedules, age restrictions, or gym policies; if a policy is not listed, say it is not specified and suggest contacting staff. "
+            "For diet questions, give broad, non-prescriptive healthy-eating information only. Do not give calorie targets, meal prescriptions, supplements, diagnosis, or treatment advice. "
+            "For minors, pregnancy, injuries, chronic conditions, allergies, or other health concerns, recommend checking with a qualified healthcare professional and gym staff. "
+            "Do not request sensitive health information. Gym reference data (JSON): " + json.dumps(facts, ensure_ascii=False)
+        )
+        if CHAT_PROVIDER == "gemini":
+            contents = [
+                {"role": "user" if message["role"] == "user" else "model", "parts": [{"text": message["content"]}]}
+                for message in history
+            ]
+            api_request = Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{quote(GEMINI_MODEL, safe='')}:generateContent",
+                data=json.dumps({
+                    "system_instruction": {"parts": [{"text": instructions}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": 350,
+                        "thinkingConfig": {"thinkingLevel": "low"},
+                    },
+                }).encode("utf-8"),
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                method="POST",
+            )
+        else:
+            api_request = Request(
+                "https://api.openai.com/v1/responses",
+                data=json.dumps({"model": OPENAI_MODEL, "instructions": instructions, "input": history, "max_output_tokens": 350, "store": False}).encode("utf-8"),
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                method="POST",
+            )
+        try:
+            for attempt in range(3):
+                try:
+                    request_timeout = 45 if CHAT_PROVIDER == "gemini" else 30
+                    with urlopen(api_request, timeout=request_timeout) as response:
+                        api_response = json.loads(response.read().decode("utf-8"))
+                    break
+                except HTTPError as error:
+                    if CHAT_PROVIDER == "gemini" and error.code in (500, 502, 503, 504) and attempt < 2:
+                        error.close()
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise
+        except HTTPError as error:
+            try:
+                error_body = json.loads(error.read().decode("utf-8"))
+                api_error = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                api_error = {}
+            api_error_code = api_error.get("code", "") if isinstance(api_error, dict) else ""
+            api_error_type = api_error.get("type", "") if isinstance(api_error, dict) else ""
+            api_error_status = api_error.get("status", "") if isinstance(api_error, dict) else ""
+            print(f"{CHAT_PROVIDER.title()} chat request failed with HTTP {error.code} ({api_error_code or api_error_status or api_error_type or 'unknown error'})")
+            if CHAT_PROVIDER == "gemini" and error.code == 429:
+                message = "Gemini API quota or rate limit reached. Check your Google AI Studio project quota and retry when available."
+            elif CHAT_PROVIDER == "gemini" and error.code in (401, 403):
+                message = "Google Gemini rejected the API key. Check GEMINI_API_KEY in .env, then restart the server."
+            elif CHAT_PROVIDER == "gemini" and error.code in (400, 404):
+                message = "Gemini rejected the model or request. Check GEMINI_MODEL in .env."
+            elif CHAT_PROVIDER == "gemini" and error.code in (500, 502, 503, 504):
+                message = f"Gemini is temporarily unavailable (HTTP {error.code}) after retries. Please wait a little and try again."
+            elif error.code == 401:
+                message = "OpenAI rejected the API key. Check OPENAI_API_KEY in .env, then restart the server."
+            elif error.code == 403:
+                message = "This API key or project cannot use the configured model. Check model access and OPENAI_MODEL in .env."
+            elif error.code == 404:
+                message = "The configured model was not found. Check OPENAI_MODEL in .env."
+            elif error.code == 429:
+                if api_error_code in ("insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded", "billing_hard_limit_reached"):
+                    message = "The OpenAI project has no available quota or has reached a usage/spend limit. Check API billing, credits, and project limits."
+                elif api_error_code in ("rate_limit_exceeded", "slow_down") or api_error_type == "rate_limit_error":
+                    message = "The chatbot is receiving requests too quickly. Wait a little and try again."
+                else:
+                    message = "OpenAI returned a 429 limit error. Check your API project’s usage, credits, and limits; wait before retrying if this is temporary."
+            elif error.code == 400:
+                message = "OpenAI rejected the chat request. Check OPENAI_MODEL in .env and restart the server."
+            else:
+                if CHAT_PROVIDER == "gemini":
+                    provider_detail = api_error_status or api_error_code or "provider error"
+                    message = f"Gemini could not answer (HTTP {error.code}, {provider_detail}). Check the server terminal for details and try again shortly."
+                else:
+                    message = f"OpenAI could not answer (HTTP {error.code}). Check the server terminal for details and try again shortly."
+            self.respond_json({"error": message}, status=502)
+            return
+        except URLError as error:
+            reason = error.reason
+            print(f"{CHAT_PROVIDER.title()} connection error: {type(reason).__name__}: {reason}")
+            if CHAT_PROVIDER == "gemini":
+                message = "Could not connect to Gemini. Check the server's internet connection and terminal error, then try again."
+            else:
+                message = "Could not connect to OpenAI. Check the server's internet connection and terminal error, then try again."
+            self.respond_json({"error": message}, status=502)
+            return
+        except TimeoutError:
+            print(f"{CHAT_PROVIDER.title()} request timed out.")
+            self.respond_json({"error": f"{CHAT_PROVIDER.title()} took too long to respond. Please try again shortly."}, status=502)
+            return
+        except json.JSONDecodeError:
+            print(f"{CHAT_PROVIDER.title()} returned a response that was not valid JSON.")
+            self.respond_json({"error": f"{CHAT_PROVIDER.title()} returned an unreadable response. Please try again shortly."}, status=502)
+            return
+        answer_parts = []
+        if CHAT_PROVIDER == "gemini":
+            candidates = api_response.get("candidates", [])
+            if candidates:
+                answer_parts = [part.get("text", "") for part in candidates[0].get("content", {}).get("parts", [])]
+        else:
+            for output_item in api_response.get("output", []):
+                if output_item.get("type") == "message" and output_item.get("role") == "assistant":
+                    answer_parts.extend(part.get("text", "") for part in output_item.get("content", []) if part.get("type") == "output_text")
+        answer = "\n".join(part for part in answer_parts if part).strip()
+        if not answer:
+            self.respond_json({"error": "The chat service returned no answer. Please try again."}, status=502)
+            return
+        self.respond_json({"reply": answer})
+
+    def redirect(self, location):
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def respond_html(self, content, status=200, extra_headers=()):
+        data = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        for name, value in extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def is_admin(self):
+        raw_cookie = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw_cookie)
+            value = jar.get("admin_session")
+            if value is None:
+                return False
+            timestamp, signature = value.value.split(".", 1)
+            issued = datetime.fromtimestamp(int(timestamp), timezone.utc)
+        except (ValueError, OverflowError):
+            return False
+        expected = signed_session(timestamp).split(".", 1)[1]
+        age = datetime.now(timezone.utc) - issued
+        return age >= timedelta(0) and age < SESSION_LIFETIME and hmac.compare_digest(signature, expected)
+
+    def save_visit(self):
+        fields = self.read_form()
+        if fields is None:
+            self.send_error(400, "Invalid form submission")
+            return
+        name = fields.get("name", [""])[0].strip()
+        email = fields.get("email", [""])[0].strip()
+        message = fields.get("message", [""])[0].strip()
+        if not name or len(name) > 120 or not email or len(email) > 254 or len(message) > 3000 or "@" not in email:
+            self.send_error(400, "Please provide a name, valid email, and a message under 3000 characters.")
+            return
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with sqlite3.connect(DATABASE) as db:
+            db.execute(
+                "INSERT INTO visits (name, email, message, created_at) VALUES (?, ?, ?, ?)",
+                (name, email, message, created_at),
+            )
+        self.redirect("/?submitted=1#contact")
+
+    def save_memberships(self):
+        fields = self.read_form()
+        if fields is None:
+            self.send_error(400, "Invalid membership update")
+            return
+        title = fields.get("title", [""])[0].strip()
+        description = fields.get("description", [""])[0].strip()
+        plans = []
+        try:
+            if not title or len(title) > 80 or len(description) > 240:
+                raise ValueError
+            for plan_id in (1, 2, 3):
+                name = fields.get(f"name_{plan_id}", [""])[0].strip()
+                price = fields.get(f"price_{plan_id}", [""])[0].strip()
+                features = [fields.get(f"feature{number}_{plan_id}", [""])[0].strip() for number in (1, 2, 3)]
+                if not name or len(name) > 40 or not price or len(price) > 8 or not price.replace(".", "", 1).isdigit():
+                    raise ValueError
+                if any(not feature or len(feature) > 100 for feature in features) or float(price) > 99999:
+                    raise ValueError
+                plans.append((name, price, *features, plan_id))
+        except ValueError:
+            self.show_admin("Please enter a title, valid prices, plan names, and all three features for each plan.", status=400)
+            return
+        with sqlite3.connect(DATABASE) as db:
+            db.execute("UPDATE membership_settings SET title = ?, description = ? WHERE id = 1", (title, description))
+            db.executemany(
+                "UPDATE membership_plans SET name = ?, price = ?, feature1 = ?, feature2 = ?, feature3 = ? WHERE id = ?",
+                plans,
+            )
+        self.redirect("/admin?memberships_saved=1#memberships")
+
+    def save_banner(self):
+        fields = self.read_form()
+        if fields is None:
+            self.send_error(400, "Invalid banner update")
+            return
+        eyebrow = fields.get("eyebrow", [""])[0].strip()
+        title = fields.get("banner_title", [""])[0].strip()
+        description = fields.get("banner_description", [""])[0].strip()
+        button_label = fields.get("button_label", [""])[0].strip()
+        button_url = fields.get("button_url", [""])[0].strip()
+        image_url = fields.get("image_url", [""])[0].strip()
+        valid_anchor = bool(re.fullmatch(r"#[A-Za-z0-9_-]+", button_url))
+        try:
+            parsed_button_url = urlparse(button_url)
+            valid_external_button = parsed_button_url.scheme in ("http", "https") and bool(parsed_button_url.netloc)
+            parsed_image_url = urlparse(image_url)
+            valid_image = not image_url or (parsed_image_url.scheme == "https" and bool(parsed_image_url.netloc))
+        except ValueError:
+            valid_external_button = False
+            valid_image = False
+        valid_fields = (
+            eyebrow and len(eyebrow) <= 100 and title and len(title) <= 160
+            and description and len(description) <= 400 and button_label and len(button_label) <= 60
+            and len(button_url) <= 500 and (valid_anchor or valid_external_button)
+            and len(image_url) <= 2048 and valid_image
+        )
+        if not valid_fields:
+            self.show_admin("Check the banner text and button link. Image URLs must use HTTPS.", status=400)
+            return
+        with sqlite3.connect(DATABASE) as db:
+            db.execute(
+                "UPDATE home_banner SET eyebrow = ?, title = ?, description = ?, button_label = ?, button_url = ?, image_url = ? WHERE id = 1",
+                (eyebrow, title, description, button_label, button_url, image_url),
+            )
+        self.redirect("/admin?banner_saved=1#banner")
+
+    def serve_home(self):
+        with open(os.path.join(ROOT, "index.html"), encoding="utf-8") as page:
+            content = page.read()
+        with sqlite3.connect(DATABASE) as db:
+            db.row_factory = sqlite3.Row
+            plans = db.execute("SELECT id, name, price, featured, feature1, feature2, feature3 FROM membership_plans ORDER BY id").fetchall()
+            settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
+            banner = db.execute("SELECT eyebrow, title, description, button_label, button_url, image_url FROM home_banner WHERE id = 1").fetchone()
+        cards = []
+        for plan in plans:
+            featured = bool(plan["featured"])
+            features = "".join(f"<li>{html.escape(plan[f'feature{number}'])}</li>" for number in (1, 2, 3))
+            badge = '<p class="badge">Most popular</p>' if featured else ""
+            card_class = "price-card featured" if featured else "price-card"
+            button_class = "btn btn-block" if featured else "btn btn-outline btn-block"
+            cards.append(
+                f'<article class="{card_class}">{badge}<h3>{html.escape(plan["name"])}</h3>'
+                f'<p class="price"><span>₹</span>{html.escape(plan["price"])}<span class="price-period">/mo</span></p>'
+                f'<ul>{features}</ul><a class="{button_class}" href="#contact">Choose {html.escape(plan["name"])}</a></article>'
+            )
+        section_header = (
+            f'<h2>{html.escape(settings["title"])}</h2>'
+            f'<p>{html.escape(settings["description"])}</p>'
+        )
+        content = content.replace("<!-- MEMBERSHIP_HEADER -->", section_header)
+        content = content.replace("<!-- MEMBERSHIP_CARDS -->", "\n".join(cards))
+        banner_image = f'<img class="hero-image" src="{html.escape(banner["image_url"], quote=True)}" alt="" aria-hidden="true">' if banner["image_url"] else ""
+        banner_title = "<br>".join(html.escape(line) for line in banner["title"].splitlines())
+        replacements = {
+            "<!-- HOME_BANNER_EYEBROW -->": html.escape(banner["eyebrow"]),
+            "<!-- HOME_BANNER_TITLE -->": banner_title,
+            "<!-- HOME_BANNER_DESCRIPTION -->": html.escape(banner["description"]),
+            "<!-- HOME_BANNER_BUTTON_LABEL -->": html.escape(banner["button_label"]),
+            "<!-- HOME_BANNER_BUTTON_URL -->": html.escape(banner["button_url"], quote=True),
+            "<!-- HOME_BANNER_IMAGE -->": banner_image,
+        }
+        for marker, value in replacements.items():
+            content = content.replace(marker, value)
+        self.respond_html(content)
+
+    def login(self):
+        fields = self.read_form()
+        username = fields.get("username", [""])[0] if fields else ""
+        password = fields.get("password", [""])[0] if fields else ""
+        if hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(password, ADMIN_PASSWORD):
+            timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+            cookie_value = signed_session(timestamp)
+            self.send_response(303)
+            self.send_header("Location", "/admin")
+            self.send_header("Set-Cookie", f"admin_session={cookie_value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200")
+            self.end_headers()
+            return
+        self.show_login("Login failed. Check your username and password.", status=401)
+
+    def show_login(self, error="", status=200):
+        alert = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
+        self.respond_html(f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin login | IronPulse</title><style>{ADMIN_CSS}</style><body><main class="panel"><a href="/" class="muted">← IronPulse website</a>
+<h1>Admin login</h1><p class="muted">Sign in to view visit requests.</p>{alert}<form action="/admin/login" method="post">
+<label>Username<input name="username" autocomplete="username" required></label><label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+<button type="submit">Sign in</button></form></main></body></html>""", status)
+
+    def show_admin(self, error="", status=200):
+        with sqlite3.connect(DATABASE) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("SELECT id, name, email, message, created_at FROM visits ORDER BY id DESC").fetchall()
+            plans = db.execute("SELECT * FROM membership_plans ORDER BY id").fetchall()
+            settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
+            banner = db.execute("SELECT eyebrow, title, description, button_label, button_url, image_url FROM home_banner WHERE id = 1").fetchone()
+        if rows:
+            entries = "".join(
+                "<tr>"
+                f"<td>{html.escape(row['created_at'].replace('T', ' '))}</td>"
+                f"<td>{html.escape(row['name'])}</td>"
+                f"<td><a href=\"mailto:{html.escape(row['email'], quote=True)}\">{html.escape(row['email'])}</a></td>"
+                f"<td class=\"message\">{html.escape(row['message']) or '<span class=\"muted\">—</span>'}</td>"
+                "</tr>"
+                for row in rows
+            )
+        else:
+            entries = '<tr><td colspan="4" class="empty">No visit requests yet.</td></tr>'
+        plan_editors = "".join(
+            f'<fieldset><legend>{html.escape(plan["name"])}</legend>'
+            f'<div class="plan-fields"><label>Plan name<input name="name_{plan["id"]}" maxlength="40" value="{html.escape(plan["name"], quote=True)}" required></label>'
+            f'<label>Monthly price (INR ₹)<input type="number" name="price_{plan["id"]}" min="0" max="99999" step="0.01" value="{html.escape(plan["price"], quote=True)}" required></label></div>'
+            + "".join(
+                f'<label>Feature {number}<input name="feature{number}_{plan["id"]}" maxlength="100" value="{html.escape(plan[f"feature{number}"], quote=True)}" required></label>'
+                for number in (1, 2, 3)
+            )
+            + "</fieldset>"
+            for plan in plans
+        )
+        query = parse_qs(urlparse(self.path).query)
+        saved_notice = '<p class="success" role="status">Memberships updated.</p>' if query.get("memberships_saved") == ["1"] else ""
+        banner_saved_notice = '<p class="success" role="status">Homepage banner updated.</p>' if query.get("banner_saved") == ["1"] else ""
+        error_notice = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
+        self.respond_html(f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin dashboard | IronPulse</title><style>{ADMIN_CSS}</style><body><div class="admin-shell">
+<aside class="sidebar"><a class="admin-brand" href="/admin"><span class="brand-mark">IP</span><span>IronPulse<small>ADMIN PANEL</small></span></a>
+<p class="nav-label">WORKSPACE</p><nav class="admin-nav" aria-label="Admin sections">
+<a href="#overview">Overview</a><a href="#contacts">Contact requests</a><a href="#banner">Homepage banner</a><a href="#memberships">Memberships</a></nav>
+<div class="sidebar-bottom"><a href="/" target="_blank" rel="noopener">View website ↗</a>
+<form action="/admin/logout" method="post"><button class="secondary" type="submit">Sign out</button></form></div></aside>
+<main class="admin-main"><header id="overview"><div><p class="muted breadcrumb">ADMIN / OVERVIEW</p><h1>Dashboard</h1><p class="muted">Manage your website content and visit requests.</p></div></header>
+<div class="summary-cards"><article><span class="muted">Contact requests</span><strong>{len(rows)}</strong></article><article><span class="muted">Membership plans</span><strong>{len(plans)}</strong></article><article><span class="muted">Content sections</span><strong>2</strong></article></div>
+<section id="contacts" class="admin-section"><div class="section-title"><div><p class="muted breadcrumb">INBOX</p><h2>Contact requests</h2><p class="muted">Messages submitted through the Visit us form.</p></div><span class="count-pill">{len(rows)} total</span></div>
+<div class="table-wrap"><table><thead><tr><th>Received (UTC)</th><th>Name</th><th>Email</th><th>Message</th></tr></thead><tbody>{entries}</tbody></table></div></section>
+<section id="banner" class="editor"><h2>Edit homepage banner</h2><p class="muted">Update the large hero banner shown at the top of the homepage.</p>{banner_saved_notice}{error_notice}
+<form action="/admin/banner" method="post"><label>Small heading<input name="eyebrow" maxlength="100" value="{html.escape(banner['eyebrow'], quote=True)}" required></label>
+<label>Banner title<textarea name="banner_title" rows="2" maxlength="160" required>{html.escape(banner['title'])}</textarea></label>
+<label>Description<textarea name="banner_description" rows="3" maxlength="400" required>{html.escape(banner['description'])}</textarea></label>
+<div class="plan-fields"><label>Button text<input name="button_label" maxlength="60" value="{html.escape(banner['button_label'], quote=True)}" required></label>
+<label>Button link<input name="button_url" maxlength="500" value="{html.escape(banner['button_url'], quote=True)}" placeholder="#pricing or https://example.com" required></label></div>
+<label>Background image URL (optional, HTTPS)<input type="url" name="image_url" maxlength="2048" value="{html.escape(banner['image_url'], quote=True)}" placeholder="https://example.com/banner.jpg"></label>
+<button type="submit">Save banner</button></form></section>
+<section id="memberships" class="editor"><h2>Edit memberships</h2><p class="muted">Changes are saved and shown on the website pricing section.</p>{saved_notice}{error_notice}
+<form action="/admin/memberships" method="post"><label>Section title<input name="title" maxlength="80" value="{html.escape(settings['title'], quote=True)}" required></label>
+<label>Section description<input name="description" maxlength="240" value="{html.escape(settings['description'], quote=True)}"></label>{plan_editors}
+<button type="submit">Save memberships</button></form></section></main></div></body></html>""", status)
+
+ADMIN_CSS = """
+:root{color-scheme:dark;--bg:#0c0d0f;--panel:#14161a;--line:rgba(255,255,255,.1);--text:#f2f4f8;--muted:#9aa3b2;--blue:#2583ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif;padding:32px}
+.panel{max-width:440px;margin:8vh auto;background:var(--panel);padding:32px;border:1px solid var(--line);border-radius:14px}
+.wide{max-width:1200px;margin:5vh auto}h1{margin:12px 0 4px}p{margin:4px 0 20px}.muted{color:var(--muted)}a{color:#75b2ff}label{display:block;margin:18px 0}input{display:block;width:100%;margin-top:6px;padding:12px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;font:inherit}
+button{padding:11px 18px;border:0;border-radius:8px;background:var(--blue);color:white;font:600 15px system-ui;cursor:pointer}.secondary{background:#252a33}header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:14px 16px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600}tr:last-child td{border-bottom:0}.message{white-space:pre-wrap;min-width:220px;max-width:480px;overflow-wrap:anywhere}.empty{text-align:center;color:var(--muted);padding:40px}.error{color:#ff9292}
+.editor{margin-top:40px;padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:12px}.editor h2{margin:0}.editor fieldset{margin:24px 0;padding:4px 20px 16px;border:1px solid var(--line);border-radius:10px}.editor legend{padding:0 8px;font-weight:700}.plan-fields{display:grid;grid-template-columns:1fr 1fr;gap:20px}textarea{display:block;width:100%;margin-top:6px;padding:12px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;font:inherit;resize:vertical}.success{color:#8dd7a2}
+@media(max-width:650px){body{padding:16px}.panel{padding:24px}.wide{margin-top:20px}header{align-items:flex-start}th,td{padding:10px}.plan-fields{grid-template-columns:1fr;gap:0}.editor{padding:18px}.editor fieldset{padding-inline:14px}}
+body{padding:0}
+.admin-shell{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:100vh}
+.sidebar{position:sticky;top:0;height:100vh;padding:26px 18px;background:#111318;border-right:1px solid var(--line);display:flex;flex-direction:column}
+.admin-brand{display:flex;align-items:center;gap:12px;color:var(--text);font-weight:700;text-decoration:none;padding:4px 8px 28px}
+.admin-brand small{display:block;color:var(--muted);font-size:10px;letter-spacing:.14em;margin-top:2px}
+.brand-mark{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:var(--blue);color:white;font-weight:800}
+.nav-label,.breadcrumb{font-size:11px;letter-spacing:.12em;font-weight:700;color:var(--muted)}.nav-label{padding:0 12px;margin:4px 0 8px}
+.admin-nav{display:grid;gap:5px}.admin-nav a{display:block;padding:11px 12px;border-radius:8px;color:var(--muted);text-decoration:none;font-size:14px;font-weight:500}
+.admin-nav a:hover,.admin-nav a:focus{background:#20242c;color:var(--text)}
+.sidebar-bottom{margin-top:auto;display:grid;gap:16px;padding:12px 8px 4px}.sidebar-bottom>a{text-decoration:none;font-size:14px}.sidebar-bottom form{margin:0}.sidebar-bottom button{width:100%}
+.admin-main{min-width:0;max-width:1500px;width:100%;padding:38px clamp(22px,4vw,64px) 64px;margin:0 auto}
+.admin-main>header{margin:0 0 26px}.admin-main h1{font-size:30px}.admin-main h2{margin:0;font-size:22px}
+.admin-main .breadcrumb{margin:0 0 6px}.admin-main header p:last-child,.section-title p:last-child{margin-bottom:0}
+.summary-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:0 0 38px}
+.summary-cards article{padding:20px;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:grid;gap:10px}
+.summary-cards strong{font-size:28px}.admin-section,.editor{scroll-margin-top:24px}
+.admin-section{margin:0 0 34px}.section-title{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}
+.count-pill{padding:5px 10px;border-radius:999px;background:#20242c;color:var(--muted);font-size:12px;white-space:nowrap}
+.admin-main .editor{margin-top:28px}.admin-main .editor h2{margin:0}
+@media(max-width:760px){body{padding:0}.admin-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:16px;border-right:0;border-bottom:1px solid var(--line)}.admin-brand{padding:0 4px 16px}.nav-label{padding:0 4px}.admin-nav{grid-template-columns:repeat(2,minmax(0,1fr))}.sidebar-bottom{grid-template-columns:1fr 1fr;align-items:center;margin-top:14px;padding:8px 4px 0}.admin-main{padding:26px 16px 48px}.summary-cards{gap:10px}.summary-cards article{padding:14px}.summary-cards strong{font-size:23px}}
+@media(max-width:460px){.summary-cards{grid-template-columns:1fr}.summary-cards article{display:flex;justify-content:space-between;align-items:center}.section-title{align-items:flex-start}.admin-nav{grid-template-columns:1fr 1fr}}
+"""
+
+
+def main():
+    global SESSION_SECRET
+    if not ADMIN_PASSWORD:
+        raise SystemExit("Set ADMIN_PASSWORD before starting the server. See README.md for instructions.")
+    if len(ADMIN_PASSWORD) < 12:
+        raise SystemExit("ADMIN_PASSWORD must be at least 12 characters long.")
+    if not SESSION_SECRET:
+        SESSION_SECRET = secrets.token_urlsafe(48)
+        print("Generated a temporary session secret for this run.")
+    initialize_database()
+    server = ThreadingHTTPServer(("127.0.0.1", 8000), WebsiteHandler)
+    print("IronPulse is running at http://127.0.0.1:8000 (admin: /admin). Press Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

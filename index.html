@@ -23,7 +23,7 @@
         <a href="#about">About</a>
         <a href="#classes">Classes</a>
         <a href="#pricing">Pricing</a>
-        <a href="#contacts">Contact123456</a>
+        <a href="#contact">Contact</a>
         <a class="btn btn-sm" href="#contact">Join Now</a>
       </nav>
     </div>
@@ -32,18 +32,20 @@
   <main>
     <section class="hero">
       <div class="hero-bg"></div>
+      <!-- HOME_BANNER_IMAGE -->
       <div class="container hero-content">
-        <p class="eyebrow">Train harder. Live stronger.</p>
-        <h1>Your goals.<br>Our floor.</h1>
-        <p class="hero-lead">24/7 access, expert coaches, and a community that keeps you accountable.</p>
+        <p class="eyebrow"><!-- HOME_BANNER_EYEBROW --></p>
+        <h1><!-- HOME_BANNER_TITLE --></h1>
+        <p class="hero-lead"><!-- HOME_BANNER_DESCRIPTION --></p>
         <div class="hero-actions">
-          <a class="btn" href="#pricing">View memberships</a>
+          <a class="btn" href="<!-- HOME_BANNER_BUTTON_URL -->"><!-- HOME_BANNER_BUTTON_LABEL --></a>
           <a class="btn btn-outline" href="#classes">Explore classes</a>
         </div>
         <ul class="hero-stats">
           <li><strong>5K+</strong> members</li>
           <li><strong>40+</strong> classes weekly</li>
-          <li><strong>24/7</strong> open gym</li>
+          <li><strong>6 AM–10 AM</strong> morning hours</li>
+          <li><strong>6 PM–10 PM</strong> evening hours</li>
         </ul>
       </div>
     </section>
@@ -101,41 +103,10 @@
     <section class="section" id="pricing">
       <div class="container">
         <header class="section-head">
-          <h2>Memberships</h2>
-          <p>Simple plans. Cancel anytime on monthly options.</p>
+          <!-- MEMBERSHIP_HEADER -->
         </header>
         <div class="pricing-grid">
-          <article class="price-card">
-            <h3>Basic</h3>
-            <p class="price"><span>$</span>29<span class="price-period">/mo</span></p>
-            <ul>
-              <li>Gym floor access</li>
-              <li>Locker room</li>
-              <li>1 guest pass / month</li>
-            </ul>
-            <a class="btn btn-outline btn-block" href="#contact">Choose Basic</a>
-          </article>
-          <article class="price-card featured">
-            <p class="badge">Most popular</p>
-            <h3>Pro</h3>
-            <p class="price"><span>$</span>49<span class="price-period">/mo</span></p>
-            <ul>
-              <li>Everything in Basic</li>
-              <li>Unlimited group classes</li>
-              <li>Monthly body scan</li>
-            </ul>
-            <a class="btn btn-block" href="#contact">Choose Pro</a>
-          </article>
-          <article class="price-card">
-            <h3>Elite</h3>
-            <p class="price"><span>$</span>89<span class="price-period">/mo</span></p>
-            <ul>
-              <li>Everything in Pro</li>
-              <li>4 PT sessions / month</li>
-              <li>Sauna &amp; recovery lounge</li>
-            </ul>
-            <a class="btn btn-outline btn-block" href="#contact">Choose Elite</a>
-          </article>
+          <!-- MEMBERSHIP_CARDS -->
         </div>
       </div>
     </section>
@@ -144,24 +115,24 @@
       <div class="container contact-layout">
         <div>
           <h2>Visit us</h2>
-          <p class="contact-detail">1420 Steel Avenue<br>Downtown · Open 24/7</p>
-          <p class="contact-detail"><a href="tel:+15551234567">(555) 123-4567</a><br><a href="mailto:hello@ironpulse.fit">hello@ironpulse.fit</a></p>
+          <p class="contact-detail">MH-Khokhran, Tehsildar ki Tanki ke paas<br>Sikar, Rajasthan 332001<br>Morning: 6 AM–10 AM<br>Evening: 6 PM–10 PM</p>
+          <p class="contact-detail"><a href="tel:+919636949201">+91 96369 49201</a><br><a href="mailto:tanwaraabid@gmail.com">tanwaraabid@gmail.com</a></p>
         </div>
-        <form class="contact-form" action="#" method="post">
+        <form class="contact-form" action="/submit" method="post">
           <label>
             Name
-            <input type="text" name="name" required placeholder="Your name">
+            <input type="text" name="name" maxlength="120" required placeholder="Your name">
           </label>
           <label>
             Email
-            <input type="email" name="email" required placeholder="you@email.com">
+            <input type="email" name="email" maxlength="254" required placeholder="you@email.com">
           </label>
           <label>
             Message
-            <textarea name="message" rows="4" placeholder="Trial visit, membership question…"></textarea>
+            <textarea name="message" rows="4" maxlength="3000" placeholder="Trial visit, membership question…"></textarea>
           </label>
           <button class="btn btn-block" type="submit">Send message</button>
-          <p class="form-note">Demo form — connect to your backend or form service when ready.</p>
+          <p class="form-note" id="form-status" role="status">Your visit request will be saved so our team can follow up.</p>
         </form>
       </div>
     </section>
@@ -170,10 +141,35 @@
   <footer class="site-footer">
     <div class="container footer-inner">
       <p>&copy; <span id="year"></span> IronPulse Fitness. All rights reserved.</p>
-      <a href="#top">Back to top</a>
+      <div><a href="/admin">Admin</a> · <a href="#top">Back to top</a></div>
     </div>
   </footer>
 
+  <section class="chat-widget" aria-label="IronPulse chat assistant">
+    <div class="chat-panel" id="chat-panel" hidden>
+      <header class="chat-header">
+        <div><strong>IronPulse Assistant</strong><span>Memberships, classes &amp; general fitness</span></div>
+        <button class="chat-close" type="button" aria-label="Close chat">×</button>
+      </header>
+      <div class="chat-messages" id="chat-messages" role="log" aria-live="polite" aria-relevant="additions">
+        <p class="chat-bubble assistant">Hi! Ask me about membership plans, class times, training goals, or general nutrition.</p>
+      </div>
+      <div class="chat-suggestions" aria-label="Suggested questions">
+        <button type="button">Membership plans</button><button type="button">Class schedule</button>
+        <button type="button">Age requirements</button><button type="button">Nutrition guidance</button>
+      </div>
+      <form class="chat-form" id="chat-form">
+        <label class="visually-hidden" for="chat-input">Your message</label>
+        <input id="chat-input" name="message" maxlength="1200" autocomplete="off" placeholder="Ask us something…" required>
+        <button type="submit" aria-label="Send message">Send</button>
+      </form>
+      <p class="chat-disclaimer">General information only. For health or diet advice, consult a qualified professional.</p>
+    </div>
+    <button class="chat-launcher" type="button" aria-controls="chat-panel" aria-expanded="false">
+      <span aria-hidden="true">✦</span> Chat with us
+    </button>
+  </section>
   <script src="js/main.js"></script>
+  <script src="js/chatbot.js"></script>
 </body>
 </html>

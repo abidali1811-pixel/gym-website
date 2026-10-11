@@ -1,0 +1,17 @@
+{
+  "gym_name": "IronPulse Fitness",
+  "location": "MH-Khokhran, Tehsildar ki Tanki ke paas, Sikar, Rajasthan 332001",
+  "hours": "Morning: 6:00 AM to 10:00 AM; evening: 6:00 PM to 10:00 PM.",
+  "phone": "+91 96369 49201",
+  "email": "tanwaraabid@gmail.com",
+  "class_schedule": [
+    {"name": "Power Lift", "type": "Strength", "schedule": "Monday, Wednesday, and Friday at 6:00 AM"},
+    {"name": "Pulse HIIT", "type": "Cardio", "schedule": "Tuesday and Thursday at 5:30 PM"},
+    {"name": "Flow & Restore", "type": "Mobility and yoga", "schedule": "Daily at 7:00 AM and 8:00 PM"},
+    {"name": "Spin Surge", "type": "Cycle", "schedule": "Saturday at 9:00 AM"}
+  ],
+  "fitness_levels": "The website says all levels are welcome. Ask gym staff about class suitability or coaching for a specific starting level.",
+  "age_guidance": "IronPulse has not published an age eligibility policy. Do not promise that someone can join based on age; direct them to gym staff. For minors, recommend involving a parent or legal guardian.",
+  "nutrition_guidance": "The assistant may share broad, non-medical healthy-eating information. Do not prescribe a diet, calorie target, supplement, or treatment plan. For personal nutrition needs, health conditions, allergies, or eating concerns, recommend a registered dietitian or healthcare professional.",
+  "personalization": "The assistant can ask about a visitor's general goal, preferred training time, and experience level. Do not ask for sensitive health details, exact birth date, or contact information in chat."
+}

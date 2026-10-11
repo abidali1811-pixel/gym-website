@@ -7,6 +7,12 @@
     yearEl.textContent = String(new Date().getFullYear());
   }
 
+  const formStatus = document.getElementById("form-status");
+  if (formStatus && new URLSearchParams(window.location.search).get("submitted") === "1") {
+    formStatus.textContent = "Thanks! Your visit request has been saved.";
+    formStatus.classList.add("form-success");
+  }
+
   if (toggle && nav) {
     toggle.addEventListener("click", () => {
       const open = nav.classList.toggle("is-open");
@@ -21,12 +27,4 @@
     });
   }
 
-  const form = document.querySelector(".contact-form");
-  if (form) {
-    form.addEventListener("submit", (e) => {
-      e.preventDefault();
-      alert("Thanks! This demo form does not send email yet — hook it up to your server when ready.");
-      form.reset();
-    });
-  }
 })();
