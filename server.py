@@ -883,8 +883,10 @@ def main():
         SESSION_SECRET = secrets.token_urlsafe(48)
         print("Generated a temporary session secret for this run.")
     initialize_database()
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), WebsiteHandler)
-    print("IronPulse is running at http://127.0.0.1:8000 (admin: /admin). Press Ctrl+C to stop.")
+    port = int(os.environ.get("PORT", "8000"))
+    host = os.environ.get("HOST", "0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), WebsiteHandler)
+    print(f"IronPulse is running on {host}:{port} (admin: /admin). Press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

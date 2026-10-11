@@ -12,6 +12,10 @@ python server.py
 
 Open [http://127.0.0.1:8000](http://127.0.0.1:8000) to view the site. Visit [http://127.0.0.1:8000/admin](http://127.0.0.1:8000/admin) and sign in with username `admin` and the password you set. The admin dashboard sidebar links to contact requests, the homepage banner, color theme, gym gallery, and memberships. Update theme colors and gallery photos with HTTPS URLs or JPG, PNG, and WebP uploads (up to 5 MB each), or edit the banner text, button, and optional HTTPS image URL; save to publish changes. Uploaded photos are stored in `uploads/gallery/`. You can override the username with the `ADMIN_USERNAME` environment variable.
 
+## Deploy on Render
+
+Create a Render Web Service with build command `pip install -r requirements.txt` and start command `python server.py`. Render supplies `PORT`; the server binds to that port and `0.0.0.0` automatically. Add `ADMIN_PASSWORD` in Render's environment settings (at least 12 characters), and keep `.env` out of the repository.
+
 Membership prices are shown in Indian rupees (INR, ₹); the amount values remain editable in the admin panel.
 
 The homepage chat assistant uses the Gemini API by default. To use OpenAI instead, set `CHAT_PROVIDER=openai` and configure `OPENAI_API_KEY` and `OPENAI_MODEL`. Restart `python server.py` after changing `.env`. The assistant answers questions about current membership plans, class schedule, general diet topics, and age policies. Edit `chatbot_knowledge.json` to update gym-specific facts; membership details are read from the admin settings. The assistant will direct visitors to staff when a policy is not listed and will not give personalized medical or diet prescriptions.
