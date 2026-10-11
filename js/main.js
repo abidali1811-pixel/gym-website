@@ -73,9 +73,63 @@
   }
 
   const formStatus = document.getElementById("form-status");
-  if (formStatus && new URLSearchParams(window.location.search).get("submitted") === "1") {
+  const phoneInput = document.querySelector('.contact-form input[name="phone"]');
+  if (phoneInput) {
+    const phoneError = document.getElementById("phone-error");
+    const validationMessage = "Enter exactly 10 digits.";
+    let phoneTouched = false;
+    const validatePhone = (showError) => {
+      const valid = /^[0-9]{10}$/.test(phoneInput.value);
+      phoneInput.setCustomValidity(phoneInput.value && !valid ? validationMessage : "");
+      phoneInput.setAttribute("aria-invalid", String(!valid && showError));
+      if (phoneError) {
+        phoneError.textContent = validationMessage;
+        phoneError.hidden = valid || !showError;
+      }
+      return valid;
+    };
+    phoneInput.addEventListener("beforeinput", (event) => {
+      if (!event.inputType.startsWith("insert")) return;
+      const inserted = event.data ?? event.dataTransfer?.getData("text") ?? "";
+      const start = phoneInput.selectionStart ?? phoneInput.value.length;
+      const end = phoneInput.selectionEnd ?? start;
+      const existingDigits = phoneInput.value.replace(/\D/g, "").length;
+      const selectedDigits = phoneInput.value.slice(start, end).replace(/\D/g, "").length;
+      const insertedDigits = inserted.replace(/\D/g, "").length;
+      if (existingDigits - selectedDigits + insertedDigits > 10) {
+        event.preventDefault();
+        if (phoneError) {
+          phoneError.textContent = "Only 10 digits are allowed. Enter exactly 10 digits to submit.";
+          phoneError.hidden = false;
+        }
+      }
+    });
+    phoneInput.addEventListener("input", () => {
+      phoneInput.value = phoneInput.value.replace(/\D/g, "").slice(0, 10);
+      validatePhone(phoneTouched);
+    });
+    phoneInput.addEventListener("blur", () => {
+      phoneTouched = true;
+      validatePhone(true);
+    });
+    phoneInput.addEventListener("invalid", () => {
+      phoneTouched = true;
+      validatePhone(true);
+    });
+    phoneInput.form?.addEventListener("submit", (event) => {
+      if (!validatePhone(true)) {
+        event.preventDefault();
+        phoneInput.reportValidity();
+      }
+    });
+  }
+  const formParams = new URLSearchParams(window.location.search);
+  if (formStatus && formParams.get("submitted") === "1") {
     formStatus.textContent = "Thanks! Your visit request has been saved.";
     formStatus.classList.add("form-success");
+  } else if (formStatus && formParams.get("form_error") === "invalid") {
+    formStatus.textContent = "Please check your name and email, and enter exactly 10 mobile digits.";
+    formStatus.classList.add("form-error");
   }
 
   if (toggle && nav) {

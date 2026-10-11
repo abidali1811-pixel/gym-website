@@ -5,7 +5,7 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from http import cookies
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import hashlib
@@ -51,6 +51,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 CHATBOT_KNOWLEDGE = os.path.join(ROOT, "chatbot_knowledge.json")
 SESSION_LIFETIME = timedelta(hours=12)
+INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 
 def initialize_database():
@@ -60,10 +61,14 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
                 message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )
         """)
+        visit_columns = {row[1] for row in db.execute("PRAGMA table_info(visits)")}
+        if "phone" not in visit_columns:
+            db.execute("ALTER TABLE visits ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         db.execute("""
             CREATE TABLE IF NOT EXISTS membership_plans (
                 id INTEGER PRIMARY KEY,
@@ -482,15 +487,21 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             return
         name = fields.get("name", [""])[0].strip()
         email = fields.get("email", [""])[0].strip()
+        phone = fields.get("phone", [""])[0].strip()
         message = fields.get("message", [""])[0].strip()
-        if not name or len(name) > 120 or not email or len(email) > 254 or len(message) > 3000 or "@" not in email:
-            self.send_error(400, "Please provide a name, valid email, and a message under 3000 characters.")
+        normalized_phone = phone
+        if (
+            not name or len(name) > 120 or not email or len(email) > 254 or "@" not in email
+            or not re.fullmatch(r"[0-9]{10}", normalized_phone)
+            or len(message) > 3000
+        ):
+            self.redirect("/?form_error=invalid#contact")
             return
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with sqlite3.connect(DATABASE) as db:
             db.execute(
-                "INSERT INTO visits (name, email, message, created_at) VALUES (?, ?, ?, ?)",
-                (name, email, message, created_at),
+                "INSERT INTO visits (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                (name, email, normalized_phone, message, created_at),
             )
         self.redirect("/?submitted=1#contact")
 
@@ -725,26 +736,111 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
 <button type="submit">Sign in</button></form></main></body></html>""", status)
 
     def show_admin(self, error="", status=200):
+        query = parse_qs(urlparse(self.path).query)
+        search_term = query.get("q", [""])[0].strip()[:120]
+        from_value = query.get("date_from", [""])[0][:16]
+        to_value = query.get("date_to", [""])[0][:16]
+        date_filters = []
+        filter_params = []
+
+        def utc_filter_value(value, include_selected_minute=False):
+            if not value:
+                return ""
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return ""
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=INDIA_TIMEZONE)
+            if include_selected_minute:
+                parsed += timedelta(minutes=1) - timedelta(seconds=1)
+            return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        from_utc = utc_filter_value(from_value)
+        to_utc = utc_filter_value(to_value, include_selected_minute=True)
+        if from_utc:
+            date_filters.append("created_at >= ?")
+            filter_params.append(from_utc)
+        if to_utc:
+            date_filters.append("created_at <= ?")
+            filter_params.append(to_utc)
+        if search_term:
+            date_filters.append("(name LIKE ? COLLATE NOCASE OR email LIKE ? COLLATE NOCASE OR phone LIKE ? OR message LIKE ? COLLATE NOCASE)")
+            search_pattern = f"%{search_term}%"
+            filter_params.extend((search_pattern, search_pattern, search_pattern, search_pattern))
+        where_clause = " WHERE " + " AND ".join(date_filters) if date_filters else ""
+        try:
+            requested_page = max(1, int(query.get("page", ["1"])[0]))
+        except ValueError:
+            requested_page = 1
+        page_size = 10
         with sqlite3.connect(DATABASE) as db:
             db.row_factory = sqlite3.Row
-            rows = db.execute("SELECT id, name, email, message, created_at FROM visits ORDER BY id DESC").fetchall()
+            total_contacts = db.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+            filtered_contacts = db.execute(
+                "SELECT COUNT(*) FROM visits" + where_clause, filter_params
+            ).fetchone()[0]
+            page_count = max(1, (filtered_contacts + page_size - 1) // page_size)
+            current_page = min(requested_page, page_count)
+            rows = db.execute(
+                "SELECT id, name, email, phone, message, created_at FROM visits" + where_clause
+                + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*filter_params, page_size, (current_page - 1) * page_size),
+            ).fetchall()
             plans = db.execute("SELECT * FROM membership_plans ORDER BY id").fetchall()
             settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
             banner = db.execute("SELECT eyebrow, title, description, button_label, button_url, image_url FROM home_banner WHERE id = 1").fetchone()
             theme = db.execute("SELECT * FROM site_theme WHERE id = 1").fetchone()
             gallery = db.execute("SELECT slot, image_url, alt_text, caption FROM gallery_images ORDER BY slot").fetchall()
         if rows:
+            def format_received(value):
+                try:
+                    received = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if received.tzinfo is None:
+                        received = received.replace(tzinfo=timezone.utc)
+                    return received.astimezone(INDIA_TIMEZONE).strftime("%d %b %Y, %I:%M %p IST")
+                except ValueError:
+                    return value
+
             entries = "".join(
                 "<tr>"
-                f"<td>{html.escape(row['created_at'].replace('T', ' '))}</td>"
+                f"<td>{html.escape(format_received(row['created_at']))}</td>"
                 f"<td>{html.escape(row['name'])}</td>"
+                f"<td>{html.escape(row['phone'])}</td>"
                 f"<td><a href=\"mailto:{html.escape(row['email'], quote=True)}\">{html.escape(row['email'])}</a></td>"
                 f"<td class=\"message\">{html.escape(row['message']) or '<span class=\"muted\">—</span>'}</td>"
                 "</tr>"
                 for row in rows
             )
         else:
-            entries = '<tr><td colspan="4" class="empty">No visit requests yet.</td></tr>'
+            empty_message = "No requests match these filters." if search_term or from_utc or to_utc else "No visit requests yet."
+            entries = f'<tr><td colspan="5" class="empty">{html.escape(empty_message)}</td></tr>'
+        result_start = (current_page - 1) * page_size + 1 if filtered_contacts else 0
+        result_end = min(current_page * page_size, filtered_contacts)
+        range_label = f"{result_start}–{result_end} of {filtered_contacts} requests"
+        filter_query = {
+            "tab": "contacts",
+            "q": search_term,
+            "date_from": from_value,
+            "date_to": to_value,
+        }
+        previous_link = (
+            f'<a class="page-link" href="/admin?{html.escape(urlencode({**filter_query, "page": current_page - 1}), quote=True)}">Previous</a>'
+            if current_page > 1 else '<span class="page-link disabled" aria-disabled="true">Previous</span>'
+        )
+        next_link = (
+            f'<a class="page-link" href="/admin?{html.escape(urlencode({**filter_query, "page": current_page + 1}), quote=True)}">Next</a>'
+            if current_page < page_count else '<span class="page-link disabled" aria-disabled="true">Next</span>'
+        )
+        contact_controls = (
+            '<form class="contact-filters" action="/admin" method="get">'
+            '<input type="hidden" name="tab" value="contacts">'
+            f'<label>Search name, mobile, email, or message<input type="search" name="q" maxlength="120" value="{html.escape(search_term, quote=True)}" placeholder="Type to search"></label>'
+            f'<label>From (India time)<input type="datetime-local" name="date_from" value="{html.escape(from_value, quote=True)}"></label>'
+            f'<label>To (India time)<input type="datetime-local" name="date_to" value="{html.escape(to_value, quote=True)}"></label>'
+            '<div class="filter-actions"><button type="submit">Search</button><a href="/admin?tab=contacts">Clear</a></div></form>'
+            f'<div class="pagination" aria-label="Contact request pages">{previous_link}<span>Page {current_page} of {page_count} · {range_label}</span>{next_link}</div>'
+        )
         plan_editors = "".join(
             f'<fieldset><legend>{html.escape(plan["name"])}</legend>'
             f'<div class="plan-fields"><label>Plan name<input name="name_{plan["id"]}" maxlength="40" value="{html.escape(plan["name"], quote=True)}" required></label>'
@@ -779,7 +875,6 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             + "</fieldset>"
             for image in gallery
         )
-        query = parse_qs(urlparse(self.path).query)
         allowed_tabs = {"overview", "contacts", "banner", "theme", "gallery-editor", "memberships"}
         active_tab = query.get("tab", [""])[0]
         if active_tab not in allowed_tabs and error:
@@ -808,11 +903,11 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
 <div class="sidebar-bottom"><a href="/" target="_blank" rel="noopener">View website ↗</a>
 <form action="/admin/logout" method="post"><button class="secondary" type="submit">Sign out</button></form></div></aside>
 <main class="admin-main"><section id="overview" class="admin-panel" {panel_visibility['overview']}><header><div><p class="muted breadcrumb">ADMIN / OVERVIEW</p><h1>Dashboard</h1><p class="muted">Manage your website content and visit requests.</p></div><a class="theme-shortcut" href="/admin?tab=theme">Edit frontend colors</a></header>
-<div class="summary-cards"><article><span class="muted">Contact requests</span><strong>{len(rows)}</strong></article><article><span class="muted">Membership plans</span><strong>{len(plans)}</strong></article><article><span class="muted">Gallery photos</span><strong>{sum(bool(image['image_url']) for image in gallery)}</strong></article></div></section>
+<div class="summary-cards"><article><span class="muted">Contact requests</span><strong>{total_contacts}</strong></article><article><span class="muted">Membership plans</span><strong>{len(plans)}</strong></article><article><span class="muted">Gallery photos</span><strong>{sum(bool(image['image_url']) for image in gallery)}</strong></article></div></section>
 <section id="theme" class="admin-panel editor theme-editor" {panel_visibility['theme']}><h2>Frontend color theme</h2><p class="muted">Adjust the main colors used across the homepage.</p>{theme_saved_notice}{error_notice}
 <form action="/admin/theme" method="post"><div class="theme-color-grid">{theme_editors}</div><button type="submit">Save theme</button></form></section>
-<section id="contacts" class="admin-panel admin-section" {panel_visibility['contacts']}><div class="section-title"><div><p class="muted breadcrumb">INBOX</p><h2>Contact requests</h2><p class="muted">Messages submitted through the Visit us form.</p></div><span class="count-pill">{len(rows)} total</span></div>
-<div class="table-wrap"><table><thead><tr><th>Received (UTC)</th><th>Name</th><th>Email</th><th>Message</th></tr></thead><tbody>{entries}</tbody></table></div></section>
+<section id="contacts" class="admin-panel admin-section" {panel_visibility['contacts']}><div class="section-title"><div><p class="muted breadcrumb">INBOX</p><h2>Contact requests</h2><p class="muted">Search by name, mobile, email, or message; filter by India date and time.</p></div><span class="count-pill">{filtered_contacts} matching</span></div>
+{contact_controls}<div class="table-wrap"><table><thead><tr><th>Received (IST)</th><th>Name</th><th>Mobile</th><th>Email</th><th>Message</th></tr></thead><tbody>{entries}</tbody></table></div></section>
 <section id="banner" class="admin-panel editor" {panel_visibility['banner']}><h2>Edit homepage banner</h2><p class="muted">Update the large hero banner shown at the top of the homepage.</p>{banner_saved_notice}{error_notice}
 <form action="/admin/banner" method="post"><label>Small heading<input name="eyebrow" maxlength="100" value="{html.escape(banner['eyebrow'], quote=True)}" required></label>
 <label>Banner title<textarea name="banner_title" rows="2" maxlength="160" required>{html.escape(banner['title'])}</textarea></label>
@@ -868,8 +963,12 @@ body{padding:0}
 .gallery-editor-card legend{color:var(--text)}
 .gallery-preview{width:100%;height:150px;object-fit:cover;border-radius:8px;border:1px solid var(--line);background:#08090b}
 .gallery-empty{display:grid;place-items:center;color:var(--muted);font-size:13px}
+.contact-filters{display:grid;grid-template-columns:minmax(220px,2fr) repeat(2,minmax(190px,1fr)) auto;align-items:end;gap:12px;margin:0 0 18px;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.contact-filters label{margin:0;color:var(--muted);font-size:13px}.contact-filters input{font-size:14px}.filter-actions{display:flex;align-items:center;gap:14px;padding-bottom:18px}.filter-actions a{white-space:nowrap;text-decoration:none}
+.pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0;color:var(--muted);font-size:13px}.page-link{display:inline-flex;align-items:center;justify-content:center;min-width:82px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;color:var(--text);text-decoration:none}.page-link:hover{background:#20242c}.page-link.disabled{color:#667080}
 @media(max-width:760px){body{padding:0}.admin-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:16px;border-right:0;border-bottom:1px solid var(--line)}.admin-brand{padding:0 4px 16px}.nav-label{padding:0 4px}.admin-nav{grid-template-columns:repeat(2,minmax(0,1fr))}.sidebar-bottom{grid-template-columns:1fr 1fr;align-items:center;margin-top:14px;padding:8px 4px 0}.admin-main{padding:26px 16px 48px}.summary-cards{gap:10px}.summary-cards article{padding:14px}.summary-cards strong{font-size:23px}}
-@media(max-width:460px){.summary-cards{grid-template-columns:1fr}.summary-cards article{display:flex;justify-content:space-between;align-items:center}.section-title{align-items:flex-start}.admin-nav{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){.contact-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.contact-filters label:first-of-type{grid-column:1/-1}.filter-actions{padding-bottom:0}}
+@media(max-width:460px){.summary-cards{grid-template-columns:1fr}.summary-cards article{display:flex;justify-content:space-between;align-items:center}.section-title{align-items:flex-start}.admin-nav{grid-template-columns:1fr 1fr}.contact-filters{grid-template-columns:1fr}.contact-filters label:first-of-type{grid-column:auto}.pagination{flex-wrap:wrap}.pagination span{order:-1;width:100%;text-align:center}}
 """
 
 

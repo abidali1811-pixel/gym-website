@@ -145,6 +145,11 @@
             <input type="email" name="email" maxlength="254" required placeholder="you@email.com">
           </label>
           <label>
+            Mobile number
+            <input type="tel" name="phone" maxlength="10" minlength="10" inputmode="numeric" autocomplete="tel-national" aria-describedby="phone-error" required pattern="[0-9]{10}" title="Enter exactly 10 digits." placeholder="9636949201">
+            <small class="field-error" id="phone-error" role="alert" hidden>Enter exactly 10 digits.</small>
+          </label>
+          <label>
             Message
             <textarea name="message" rows="4" maxlength="3000" placeholder="Trial visit, membership question…"></textarea>
           </label>

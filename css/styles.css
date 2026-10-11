@@ -506,6 +506,21 @@ a:hover {
   color: #78b6ff;
 }
 
+.form-error {
+  color: #ff8585;
+}
+
+.field-error {
+  display: block;
+  margin-top: 0.4rem;
+  color: #ff8585;
+  font-size: 0.8rem;
+}
+
+.field-error[hidden] {
+  display: none;
+}
+
 .site-footer {
   padding: 2rem 0;
   border-top: 1px solid var(--border);
