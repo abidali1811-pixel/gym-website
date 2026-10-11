@@ -1,4 +1,4 @@
-"""Small SQLite-backed web server for the IronPulse contact form and admin page."""
+"""SQLite/Supabase-backed web server for the IronPulse website and admin page."""
 
 from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
@@ -17,6 +17,11 @@ import re
 import secrets
 import sqlite3
 import time
+
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -52,13 +57,81 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 CHATBOT_KNOWLEDGE = os.path.join(ROOT, "chatbot_knowledge.json")
 SESSION_LIFETIME = timedelta(hours=12)
 INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_ERRORS = (sqlite3.Error,) + ((psycopg.Error,) if psycopg is not None else ())
+
+
+class DatabaseRow(dict):
+    def __init__(self, names, values):
+        self._values = tuple(values)
+        super().__init__(zip(names, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+def postgres_row_factory(cursor):
+    names = [column.name for column in cursor.description] if cursor.description else []
+
+    def make_row(values):
+        return DatabaseRow(names, values)
+
+    return make_row
+
+
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.connection.__exit__(exc_type, exc_value, traceback)
+
+    @property
+    def row_factory(self):
+        return postgres_row_factory
+
+    @row_factory.setter
+    def row_factory(self, _value):
+        pass
+
+    def execute(self, sql, parameters=()):
+        cursor = self.connection.cursor()
+        cursor.execute(sql.replace("?", "%s"), parameters)
+        return cursor
+
+    def executemany(self, sql, parameters):
+        cursor = self.connection.cursor()
+        cursor.executemany(sql.replace("?", "%s"), parameters)
+        return cursor
+
+
+def connect_database():
+    if not DATABASE_URL:
+        return sqlite3.connect(DATABASE)
+    if psycopg is None:
+        raise RuntimeError("DATABASE_URL is set but psycopg is unavailable. Install dependencies from requirements.txt.")
+    connection = psycopg.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10,
+        prepare_threshold=None,
+        row_factory=postgres_row_factory,
+    )
+    return PostgresConnection(connection)
 
 
 def initialize_database():
-    with sqlite3.connect(DATABASE) as db:
-        db.execute("""
+    id_column = "BIGSERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with connect_database() as db:
+        db.execute(f"""
             CREATE TABLE IF NOT EXISTS visits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_column},
                 name TEXT NOT NULL,
                 email TEXT NOT NULL,
                 phone TEXT NOT NULL DEFAULT '',
@@ -66,7 +139,12 @@ def initialize_database():
                 created_at TEXT NOT NULL
             )
         """)
-        visit_columns = {row[1] for row in db.execute("PRAGMA table_info(visits)")}
+        if DATABASE_URL:
+            visit_columns = {row[0] for row in db.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'visits'"
+            ).fetchall()}
+        else:
+            visit_columns = {row[1] for row in db.execute("PRAGMA table_info(visits)")}
         if "phone" not in visit_columns:
             db.execute("ALTER TABLE visits ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         db.execute("""
@@ -119,7 +197,7 @@ def initialize_database():
             )
         """)
         db.execute(
-            "INSERT OR IGNORE INTO membership_settings (id, title, description) VALUES (1, ?, ?)",
+            "INSERT INTO membership_settings (id, title, description) VALUES (1, ?, ?) ON CONFLICT (id) DO NOTHING",
             ("Memberships", "Simple plans. Cancel anytime on monthly options."),
         )
         defaults = [
@@ -128,13 +206,13 @@ def initialize_database():
             (3, "Elite", "89", 0, "Everything in Pro", "4 PT sessions / month", "Sauna & recovery lounge"),
         ]
         db.executemany(
-            "INSERT OR IGNORE INTO membership_plans "
-            "(id, name, price, featured, feature1, feature2, feature3) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO membership_plans "
+            "(id, name, price, featured, feature1, feature2, feature3) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             defaults,
         )
         db.execute(
-            "INSERT OR IGNORE INTO home_banner "
-            "(id, eyebrow, title, description, button_label, button_url, image_url) VALUES (1, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO home_banner "
+            "(id, eyebrow, title, description, button_label, button_url, image_url) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             ("Train harder. Live stronger.", "Your goals.\nOur floor.", "Morning gym hours: 6:00 AM–10:00 AM; evening hours: 6:00 PM–10:00 PM. Expert coaches and a community that keeps you accountable.", "View memberships", "#pricing", ""),
         )
         db.execute(
@@ -145,9 +223,9 @@ def initialize_database():
             ),
         )
         db.execute(
-            "INSERT OR IGNORE INTO site_theme "
+            "INSERT INTO site_theme "
             "(id, accent, accent_hover, background, background_elevated, surface, text_color, muted) "
-            "VALUES (1, '#2583ff', '#4b9aff', '#0c0d0f', '#14161a', '#1a1d24', '#f2f4f8', '#9aa3b2')"
+            "VALUES (1, '#2583ff', '#4b9aff', '#0c0d0f', '#14161a', '#1a1d24', '#f2f4f8', '#9aa3b2') ON CONFLICT (id) DO NOTHING"
         )
         gallery_defaults = [
             (1, "https://images.unsplash.com/photo-1697490562519-3eb03dab6d5f?auto=format&fit=crop&w=1400&q=85", "Modern gym interior with strength equipment", "The training floor"),
@@ -156,7 +234,7 @@ def initialize_database():
             (4, "https://images.unsplash.com/photo-1574680088814-c9e8a10d8a4d?auto=format&fit=crop&w=1200&q=85", "Athlete lifting weights in the gym", "Find your next level"),
         ]
         db.executemany(
-            "INSERT OR IGNORE INTO gallery_images (slot, image_url, alt_text, caption) VALUES (?, ?, ?, ?)",
+            "INSERT INTO gallery_images (slot, image_url, alt_text, caption) VALUES (?, ?, ?, ?) ON CONFLICT (slot) DO NOTHING",
             gallery_defaults,
         )
 
@@ -318,7 +396,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         try:
             with open(CHATBOT_KNOWLEDGE, encoding="utf-8") as knowledge_file:
                 facts = json.load(knowledge_file)
-            with sqlite3.connect(DATABASE) as db:
+            with connect_database() as db:
                 db.row_factory = sqlite3.Row
                 plans = db.execute("SELECT name, price, feature1, feature2, feature3 FROM membership_plans ORDER BY id").fetchall()
             facts["current_memberships"] = [
@@ -326,7 +404,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
                 for plan in plans
             ]
             facts["membership_currency"] = "INR (Indian rupees)"
-        except (OSError, json.JSONDecodeError, sqlite3.Error):
+        except (OSError, json.JSONDecodeError) + DATABASE_ERRORS:
             self.respond_json({"error": "The gym information file could not be loaded. Please contact the gym directly."}, status=500)
             return
         instructions = (
@@ -498,7 +576,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             self.redirect("/?form_error=invalid#contact")
             return
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.execute(
                 "INSERT INTO visits (name, email, phone, message, created_at) VALUES (?, ?, ?, ?, ?)",
                 (name, email, normalized_phone, message, created_at),
@@ -528,7 +606,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         except ValueError:
             self.show_admin("Please enter a title, valid prices, plan names, and all three features for each plan.", status=400)
             return
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.execute("UPDATE membership_settings SET title = ?, description = ? WHERE id = 1", (title, description))
             db.executemany(
                 "UPDATE membership_plans SET name = ?, price = ?, feature1 = ?, feature2 = ?, feature3 = ? WHERE id = ?",
@@ -565,7 +643,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         if not valid_fields:
             self.show_admin("Check the banner text and button link. Image URLs must use HTTPS.", status=400)
             return
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.execute(
                 "UPDATE home_banner SET eyebrow = ?, title = ?, description = ?, button_label = ?, button_url = ?, image_url = ? WHERE id = 1",
                 (eyebrow, title, description, button_label, button_url, image_url),
@@ -582,7 +660,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         if any(not re.fullmatch(r"#[0-9a-fA-F]{6}", color) for color in colors.values()):
             self.show_admin("Choose a valid color for every theme field.", status=400)
             return
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.execute(
                 "UPDATE site_theme SET accent = ?, accent_hover = ?, background = ?, background_elevated = ?, "
                 "surface = ?, text_color = ?, muted = ? WHERE id = 1",
@@ -644,7 +722,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.show_admin("The image upload could not be saved. Check the server folder permissions and try again.", status=500)
             return
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.executemany(
                 "UPDATE gallery_images SET image_url = ?, alt_text = ?, caption = ? WHERE slot = ?",
                 images,
@@ -654,7 +732,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
     def serve_home(self):
         with open(os.path.join(ROOT, "index.html"), encoding="utf-8") as page:
             content = page.read()
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.row_factory = sqlite3.Row
             plans = db.execute("SELECT id, name, price, featured, feature1, feature2, feature3 FROM membership_plans ORDER BY id").fetchall()
             settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
@@ -765,7 +843,10 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             date_filters.append("created_at <= ?")
             filter_params.append(to_utc)
         if search_term:
-            date_filters.append("(name LIKE ? COLLATE NOCASE OR email LIKE ? COLLATE NOCASE OR phone LIKE ? OR message LIKE ? COLLATE NOCASE)")
+            like_operator = "ILIKE" if DATABASE_URL else "LIKE"
+            date_filters.append(
+                f"(name {like_operator} ? OR email {like_operator} ? OR phone {like_operator} ? OR message {like_operator} ?)"
+            )
             search_pattern = f"%{search_term}%"
             filter_params.extend((search_pattern, search_pattern, search_pattern, search_pattern))
         where_clause = " WHERE " + " AND ".join(date_filters) if date_filters else ""
@@ -774,7 +855,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         except ValueError:
             requested_page = 1
         page_size = 10
-        with sqlite3.connect(DATABASE) as db:
+        with connect_database() as db:
             db.row_factory = sqlite3.Row
             total_contacts = db.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
             filtered_contacts = db.execute(
@@ -982,6 +1063,7 @@ def main():
         SESSION_SECRET = secrets.token_urlsafe(48)
         print("Generated a temporary session secret for this run.")
     initialize_database()
+    print("Database: Supabase PostgreSQL" if DATABASE_URL else f"Database: local SQLite ({DATABASE})")
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
     server = ThreadingHTTPServer((host, port), WebsiteHandler)

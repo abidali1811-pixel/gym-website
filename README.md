@@ -1,6 +1,6 @@
 # IronPulse Fitness — Simple Gym Website
 
-A responsive gym website with a Python server that saves visit requests to a local SQLite database and provides a password-protected admin page.
+A responsive gym website with a Python server that saves visit requests and admin settings to local SQLite or Supabase PostgreSQL, and provides a password-protected admin page.
 
 ## Run locally
 
@@ -16,11 +16,13 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000) to view the site. Visit [htt
 
 Create a Render Web Service with build command `pip install -r requirements.txt` and start command `python server.py`. Render supplies `PORT`; the server binds to that port and `0.0.0.0` automatically. Add `ADMIN_PASSWORD` in Render's environment settings (at least 12 characters), and keep `.env` out of the repository.
 
+To keep database data across deployments, create a Supabase project, copy its PostgreSQL connection string from the dashboard's **Connect** panel, and add it as the `DATABASE_URL` environment variable in Render. The app creates its tables on startup. Leave `DATABASE_URL` blank for local SQLite. Supabase recommends a direct connection for persistent backends; use its session pooler connection string if your host cannot reach the direct endpoint.
+
 Membership prices are shown in Indian rupees (INR, ₹); the amount values remain editable in the admin panel.
 
 The homepage chat assistant uses the Gemini API by default. To use OpenAI instead, set `CHAT_PROVIDER=openai` and configure `OPENAI_API_KEY` and `OPENAI_MODEL`. Restart `python server.py` after changing `.env`. The assistant answers questions about current membership plans, class schedule, general diet topics, and age policies. Edit `chatbot_knowledge.json` to update gym-specific facts; membership details are read from the admin settings. The assistant will direct visitors to staff when a policy is not listed and will not give personalized medical or diet prescriptions.
 
-New form submissions are saved in `visits.sqlite3` in this folder. Keep this file backed up if you need to retain requests. The server listens on your own computer only; public hosting needs HTTPS and suitable production hosting configuration.
+With local SQLite, form submissions and admin settings are saved in `visits.sqlite3` in this folder. On Render, configure Supabase PostgreSQL using `DATABASE_URL` because files on the app instance may not persist across deployments. The server listens on your own computer only during local runs; public hosting needs HTTPS and suitable production hosting configuration.
 
 ## Structure
 

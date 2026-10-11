@@ -1,1 +1,1 @@
-# IronPulse uses only Python's standard library. No pip packages are required.
+psycopg[binary]>=3.3,<4
