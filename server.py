@@ -1,6 +1,8 @@
 """Small SQLite-backed web server for the IronPulse contact form and admin page."""
 
 from datetime import datetime, timedelta, timezone
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http import cookies
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
@@ -19,6 +21,7 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(ROOT, "visits.sqlite3")
+GALLERY_UPLOAD_DIR = os.path.join(ROOT, "uploads", "gallery")
 
 
 def load_local_env():
@@ -90,6 +93,26 @@ def initialize_database():
                 image_url TEXT NOT NULL DEFAULT ''
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS site_theme (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                accent TEXT NOT NULL,
+                accent_hover TEXT NOT NULL,
+                background TEXT NOT NULL,
+                background_elevated TEXT NOT NULL,
+                surface TEXT NOT NULL,
+                text_color TEXT NOT NULL,
+                muted TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS gallery_images (
+                slot INTEGER PRIMARY KEY,
+                image_url TEXT NOT NULL DEFAULT '',
+                alt_text TEXT NOT NULL,
+                caption TEXT NOT NULL
+            )
+        """)
         db.execute(
             "INSERT OR IGNORE INTO membership_settings (id, title, description) VALUES (1, ?, ?)",
             ("Memberships", "Simple plans. Cancel anytime on monthly options."),
@@ -115,6 +138,21 @@ def initialize_database():
                 "Morning gym hours: 6:00 AM–10:00 AM; evening hours: 6:00 PM–10:00 PM. Expert coaches and a community that keeps you accountable.",
                 "24/7 access, expert coaches, and a community that keeps you accountable.",
             ),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO site_theme "
+            "(id, accent, accent_hover, background, background_elevated, surface, text_color, muted) "
+            "VALUES (1, '#2583ff', '#4b9aff', '#0c0d0f', '#14161a', '#1a1d24', '#f2f4f8', '#9aa3b2')"
+        )
+        gallery_defaults = [
+            (1, "https://images.unsplash.com/photo-1697490562519-3eb03dab6d5f?auto=format&fit=crop&w=1400&q=85", "Modern gym interior with strength equipment", "The training floor"),
+            (2, "https://images.unsplash.com/photo-1718633561231-864a4c466991?auto=format&fit=crop&w=1200&q=85", "Athlete performing a barbell squat", "Strength, with purpose"),
+            (3, "https://images.unsplash.com/photo-1704223523492-6279abd5261b?auto=format&fit=crop&w=1200&q=85", "Athlete training with dumbbells", "Built one rep at a time"),
+            (4, "https://images.unsplash.com/photo-1574680088814-c9e8a10d8a4d?auto=format&fit=crop&w=1200&q=85", "Athlete lifting weights in the gym", "Find your next level"),
+        ]
+        db.executemany(
+            "INSERT OR IGNORE INTO gallery_images (slot, image_url, alt_text, caption) VALUES (?, ?, ?, ?)",
+            gallery_defaults,
         )
 
 
@@ -159,6 +197,16 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
                 self.save_banner()
             else:
                 self.send_error(403, "Please sign in to edit the banner")
+        elif path == "/admin/theme":
+            if self.is_admin():
+                self.save_theme()
+            else:
+                self.send_error(403, "Please sign in to edit the theme")
+        elif path == "/admin/gallery":
+            if self.is_admin():
+                self.save_gallery()
+            else:
+                self.send_error(403, "Please sign in to edit the gallery")
         elif path == "/api/chat":
             self.chat_reply()
         elif path == "/admin/logout":
@@ -178,6 +226,39 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             return None
         body = self.rfile.read(length).decode("utf-8", errors="replace")
         return parse_qs(body, keep_blank_values=True)
+
+    def read_gallery_form(self):
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            fields = self.read_form()
+            return (fields, {}) if fields is not None else (None, None)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None, None
+        if length <= 0 or length > 22 * 1024 * 1024:
+            return None, None
+        raw_body = self.rfile.read(length)
+        message = BytesParser(policy=email_policy).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + raw_body
+        )
+        if not message.is_multipart():
+            return None, None
+        fields = {}
+        files = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename:
+                if payload:
+                    files[name] = payload
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = [payload.decode(charset, errors="replace")]
+        return fields, files
 
     def read_json(self):
         try:
@@ -442,7 +523,7 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
                 "UPDATE membership_plans SET name = ?, price = ?, feature1 = ?, feature2 = ?, feature3 = ? WHERE id = ?",
                 plans,
             )
-        self.redirect("/admin?memberships_saved=1#memberships")
+        self.redirect("/admin?memberships_saved=1&tab=memberships")
 
     def save_banner(self):
         fields = self.read_form()
@@ -478,7 +559,86 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
                 "UPDATE home_banner SET eyebrow = ?, title = ?, description = ?, button_label = ?, button_url = ?, image_url = ? WHERE id = 1",
                 (eyebrow, title, description, button_label, button_url, image_url),
             )
-        self.redirect("/admin?banner_saved=1#banner")
+        self.redirect("/admin?banner_saved=1&tab=banner")
+
+    def save_theme(self):
+        fields = self.read_form()
+        if fields is None:
+            self.send_error(400, "Invalid theme update")
+            return
+        names = ("accent", "accent_hover", "background", "background_elevated", "surface", "text_color", "muted")
+        colors = {name: fields.get(name, [""])[0].strip() for name in names}
+        if any(not re.fullmatch(r"#[0-9a-fA-F]{6}", color) for color in colors.values()):
+            self.show_admin("Choose a valid color for every theme field.", status=400)
+            return
+        with sqlite3.connect(DATABASE) as db:
+            db.execute(
+                "UPDATE site_theme SET accent = ?, accent_hover = ?, background = ?, background_elevated = ?, "
+                "surface = ?, text_color = ?, muted = ? WHERE id = 1",
+                tuple(colors[name] for name in names),
+            )
+        self.redirect("/admin?theme_saved=1&tab=theme")
+
+    def save_gallery(self):
+        fields, files = self.read_gallery_form()
+        if fields is None:
+            self.send_error(400, "Invalid gallery update")
+            return
+        images = []
+        pending_uploads = []
+        for slot in range(1, 5):
+            image_url = fields.get(f"image_url_{slot}", [""])[0].strip()
+            alt_text = fields.get(f"alt_text_{slot}", [""])[0].strip()
+            caption = fields.get(f"caption_{slot}", [""])[0].strip()
+            upload = files.get(f"image_file_{slot}")
+            extension = None
+            if upload:
+                if len(upload) > 5 * 1024 * 1024:
+                    self.show_admin("Each gallery upload must be 5 MB or smaller.", status=400)
+                    return
+                if upload.startswith(b"\xff\xd8\xff"):
+                    extension = ".jpg"
+                elif upload.startswith(b"\x89PNG\r\n\x1a\n"):
+                    extension = ".png"
+                elif upload.startswith(b"RIFF") and upload[8:12] == b"WEBP":
+                    extension = ".webp"
+                if not extension:
+                    self.show_admin("Gallery uploads must be valid JPG, PNG, or WebP images.", status=400)
+                    return
+                image_url = "__upload__"
+            try:
+                parsed_url = urlparse(image_url)
+                valid_url = (
+                    not image_url
+                    or image_url == "__upload__"
+                    or bool(re.fullmatch(r"/uploads/gallery/[0-9a-f]{32}\.(?:jpg|png|webp)", image_url))
+                    or (parsed_url.scheme == "https" and bool(parsed_url.netloc))
+                )
+            except ValueError:
+                valid_url = False
+            if len(image_url) > 2048 or not valid_url or len(alt_text) > 140 or len(caption) > 80:
+                self.show_admin("Gallery images need a valid HTTPS URL; captions and descriptions must fit their limits.", status=400)
+                return
+            if extension:
+                pending_uploads.append((len(images), upload, extension))
+            images.append((image_url, alt_text, caption, slot))
+        try:
+            os.makedirs(GALLERY_UPLOAD_DIR, exist_ok=True)
+            for image_index, upload, extension in pending_uploads:
+                filename = f"{secrets.token_hex(16)}{extension}"
+                with open(os.path.join(GALLERY_UPLOAD_DIR, filename), "xb") as image_file:
+                    image_file.write(upload)
+                image_url, alt_text, caption, slot = images[image_index]
+                images[image_index] = (f"/uploads/gallery/{filename}", alt_text, caption, slot)
+        except OSError:
+            self.show_admin("The image upload could not be saved. Check the server folder permissions and try again.", status=500)
+            return
+        with sqlite3.connect(DATABASE) as db:
+            db.executemany(
+                "UPDATE gallery_images SET image_url = ?, alt_text = ?, caption = ? WHERE slot = ?",
+                images,
+            )
+        self.redirect("/admin?gallery_saved=1&tab=gallery-editor")
 
     def serve_home(self):
         with open(os.path.join(ROOT, "index.html"), encoding="utf-8") as page:
@@ -488,6 +648,8 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             plans = db.execute("SELECT id, name, price, featured, feature1, feature2, feature3 FROM membership_plans ORDER BY id").fetchall()
             settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
             banner = db.execute("SELECT eyebrow, title, description, button_label, button_url, image_url FROM home_banner WHERE id = 1").fetchone()
+            theme = db.execute("SELECT * FROM site_theme WHERE id = 1").fetchone()
+            gallery = db.execute("SELECT slot, image_url, alt_text, caption FROM gallery_images ORDER BY slot").fetchall()
         cards = []
         for plan in plans:
             featured = bool(plan["featured"])
@@ -506,6 +668,26 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         )
         content = content.replace("<!-- MEMBERSHIP_HEADER -->", section_header)
         content = content.replace("<!-- MEMBERSHIP_CARDS -->", "\n".join(cards))
+        gallery_cards = []
+        for image in gallery:
+            if not image["image_url"]:
+                continue
+            loading = "eager" if image["slot"] == 1 else "lazy"
+            gallery_cards.append(
+                f'<figure class="gallery-card tilt-card reveal"><div class="gallery-image-wrap">'
+                f'<img src="{html.escape(image["image_url"], quote=True)}" alt="{html.escape(image["alt_text"], quote=True)}" loading="{loading}" decoding="async">'
+                f'</div><figcaption>{html.escape(image["caption"])}</figcaption></figure>'
+            )
+        content = content.replace("<!-- GYM_GALLERY -->", "\n".join(gallery_cards))
+        theme_variables = {
+            "--accent": theme["accent"], "--accent-hover": theme["accent_hover"], "--bg": theme["background"],
+            "--bg-elevated": theme["background_elevated"], "--surface": theme["surface"],
+            "--text": theme["text_color"], "--muted": theme["muted"],
+        }
+        theme_css = "<style id=\"site-theme\">:root{" + "".join(
+            f"{name}:{html.escape(value)};" for name, value in theme_variables.items()
+        ) + "}</style>"
+        content = content.replace("<!-- SITE_THEME -->", theme_css)
         banner_image = f'<img class="hero-image" src="{html.escape(banner["image_url"], quote=True)}" alt="" aria-hidden="true">' if banner["image_url"] else ""
         banner_title = "<br>".join(html.escape(line) for line in banner["title"].splitlines())
         replacements = {
@@ -549,6 +731,8 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             plans = db.execute("SELECT * FROM membership_plans ORDER BY id").fetchall()
             settings = db.execute("SELECT title, description FROM membership_settings WHERE id = 1").fetchone()
             banner = db.execute("SELECT eyebrow, title, description, button_label, button_url, image_url FROM home_banner WHERE id = 1").fetchone()
+            theme = db.execute("SELECT * FROM site_theme WHERE id = 1").fetchone()
+            gallery = db.execute("SELECT slot, image_url, alt_text, caption FROM gallery_images ORDER BY slot").fetchall()
         if rows:
             entries = "".join(
                 "<tr>"
@@ -572,22 +756,64 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
             + "</fieldset>"
             for plan in plans
         )
+        theme_fields = (
+            ("accent", "Accent color", theme["accent"]),
+            ("accent_hover", "Accent hover", theme["accent_hover"]),
+            ("background", "Page background", theme["background"]),
+            ("background_elevated", "Raised background", theme["background_elevated"]),
+            ("surface", "Cards and panels", theme["surface"]),
+            ("text_color", "Main text", theme["text_color"]),
+            ("muted", "Muted text", theme["muted"]),
+        )
+        theme_editors = "".join(
+            f'<label class="color-field"><span>{label}</span><input type="color" name="{name}" value="{html.escape(value, quote=True)}" aria-label="{label}"></label>'
+            for name, label, value in theme_fields
+        )
+        gallery_editors = "".join(
+            f'<fieldset class="gallery-editor-card"><legend>Photo {image["slot"]}</legend>'
+            + (f'<img class="gallery-preview" src="{html.escape(image["image_url"], quote=True)}" alt="">' if image["image_url"] else '<div class="gallery-preview gallery-empty">No image selected</div>')
+            + f'<label>Photo URL (optional, HTTPS)<input type="text" name="image_url_{image["slot"]}" maxlength="2048" value="{html.escape(image["image_url"], quote=True)}" placeholder="https://images.example.com/gym.jpg"></label>'
+            + f'<label>Upload photo (JPG, PNG, WebP; max 5 MB)<input type="file" name="image_file_{image["slot"]}" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>'
+            + f'<label>Image description<input name="alt_text_{image["slot"]}" maxlength="140" value="{html.escape(image["alt_text"], quote=True)}" required></label>'
+            + f'<label>Caption<input name="caption_{image["slot"]}" maxlength="80" value="{html.escape(image["caption"], quote=True)}" required></label>'
+            + "</fieldset>"
+            for image in gallery
+        )
         query = parse_qs(urlparse(self.path).query)
+        allowed_tabs = {"overview", "contacts", "banner", "theme", "gallery-editor", "memberships"}
+        active_tab = query.get("tab", [""])[0]
+        if active_tab not in allowed_tabs and error:
+            active_tab = {
+                "/admin/memberships": "memberships",
+                "/admin/banner": "banner",
+                "/admin/theme": "theme",
+                "/admin/gallery": "gallery-editor",
+            }.get(urlparse(self.path).path, "overview")
+        if active_tab not in allowed_tabs:
+            active_tab = "overview"
+        panel_visibility = {
+            tab: "" if tab == active_tab else "hidden"
+            for tab in allowed_tabs
+        }
         saved_notice = '<p class="success" role="status">Memberships updated.</p>' if query.get("memberships_saved") == ["1"] else ""
         banner_saved_notice = '<p class="success" role="status">Homepage banner updated.</p>' if query.get("banner_saved") == ["1"] else ""
+        theme_saved_notice = '<p class="success" role="status">Theme colors updated.</p>' if query.get("theme_saved") == ["1"] else ""
+        gallery_saved_notice = '<p class="success" role="status">Gym gallery updated.</p>' if query.get("gallery_saved") == ["1"] else ""
         error_notice = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
         self.respond_html(f"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin dashboard | IronPulse</title><style>{ADMIN_CSS}</style><body><div class="admin-shell">
 <aside class="sidebar"><a class="admin-brand" href="/admin"><span class="brand-mark">IP</span><span>IronPulse<small>ADMIN PANEL</small></span></a>
 <p class="nav-label">WORKSPACE</p><nav class="admin-nav" aria-label="Admin sections">
-<a href="#overview">Overview</a><a href="#contacts">Contact requests</a><a href="#banner">Homepage banner</a><a href="#memberships">Memberships</a></nav>
+<a href="/admin?tab=overview">Overview</a><a href="/admin?tab=contacts">Contact requests</a><a href="/admin?tab=banner">Homepage banner</a><a href="/admin?tab=theme">Color theme</a><a href="/admin?tab=gallery-editor">Gym gallery</a><a href="/admin?tab=memberships">Memberships</a></nav>
 <div class="sidebar-bottom"><a href="/" target="_blank" rel="noopener">View website ↗</a>
 <form action="/admin/logout" method="post"><button class="secondary" type="submit">Sign out</button></form></div></aside>
-<main class="admin-main"><header id="overview"><div><p class="muted breadcrumb">ADMIN / OVERVIEW</p><h1>Dashboard</h1><p class="muted">Manage your website content and visit requests.</p></div></header>
-<div class="summary-cards"><article><span class="muted">Contact requests</span><strong>{len(rows)}</strong></article><article><span class="muted">Membership plans</span><strong>{len(plans)}</strong></article><article><span class="muted">Content sections</span><strong>2</strong></article></div>
-<section id="contacts" class="admin-section"><div class="section-title"><div><p class="muted breadcrumb">INBOX</p><h2>Contact requests</h2><p class="muted">Messages submitted through the Visit us form.</p></div><span class="count-pill">{len(rows)} total</span></div>
+<main class="admin-main"><section id="overview" class="admin-panel" {panel_visibility['overview']}><header><div><p class="muted breadcrumb">ADMIN / OVERVIEW</p><h1>Dashboard</h1><p class="muted">Manage your website content and visit requests.</p></div><a class="theme-shortcut" href="/admin?tab=theme">Edit frontend colors</a></header>
+<div class="summary-cards"><article><span class="muted">Contact requests</span><strong>{len(rows)}</strong></article><article><span class="muted">Membership plans</span><strong>{len(plans)}</strong></article><article><span class="muted">Gallery photos</span><strong>{sum(bool(image['image_url']) for image in gallery)}</strong></article></div></section>
+<section id="theme" class="admin-panel editor theme-editor" {panel_visibility['theme']}><h2>Frontend color theme</h2><p class="muted">Adjust the main colors used across the homepage.</p>{theme_saved_notice}{error_notice}
+<form action="/admin/theme" method="post"><div class="theme-color-grid">{theme_editors}</div><button type="submit">Save theme</button></form></section>
+<section id="contacts" class="admin-panel admin-section" {panel_visibility['contacts']}><div class="section-title"><div><p class="muted breadcrumb">INBOX</p><h2>Contact requests</h2><p class="muted">Messages submitted through the Visit us form.</p></div><span class="count-pill">{len(rows)} total</span></div>
 <div class="table-wrap"><table><thead><tr><th>Received (UTC)</th><th>Name</th><th>Email</th><th>Message</th></tr></thead><tbody>{entries}</tbody></table></div></section>
-<section id="banner" class="editor"><h2>Edit homepage banner</h2><p class="muted">Update the large hero banner shown at the top of the homepage.</p>{banner_saved_notice}{error_notice}
+<section id="banner" class="admin-panel editor" {panel_visibility['banner']}><h2>Edit homepage banner</h2><p class="muted">Update the large hero banner shown at the top of the homepage.</p>{banner_saved_notice}{error_notice}
 <form action="/admin/banner" method="post"><label>Small heading<input name="eyebrow" maxlength="100" value="{html.escape(banner['eyebrow'], quote=True)}" required></label>
 <label>Banner title<textarea name="banner_title" rows="2" maxlength="160" required>{html.escape(banner['title'])}</textarea></label>
 <label>Description<textarea name="banner_description" rows="3" maxlength="400" required>{html.escape(banner['description'])}</textarea></label>
@@ -595,7 +821,9 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
 <label>Button link<input name="button_url" maxlength="500" value="{html.escape(banner['button_url'], quote=True)}" placeholder="#pricing or https://example.com" required></label></div>
 <label>Background image URL (optional, HTTPS)<input type="url" name="image_url" maxlength="2048" value="{html.escape(banner['image_url'], quote=True)}" placeholder="https://example.com/banner.jpg"></label>
 <button type="submit">Save banner</button></form></section>
-<section id="memberships" class="editor"><h2>Edit memberships</h2><p class="muted">Changes are saved and shown on the website pricing section.</p>{saved_notice}{error_notice}
+<section id="gallery-editor" class="admin-panel editor" {panel_visibility['gallery-editor']}><h2>Gym photo gallery</h2><p class="muted">Replace the four homepage photos with an HTTPS URL or upload a JPG, PNG, or WebP image. An uploaded photo replaces its URL; clear both to remove a photo.</p>{gallery_saved_notice}{error_notice}
+<form action="/admin/gallery" method="post" enctype="multipart/form-data"><div class="gallery-admin-grid">{gallery_editors}</div><button type="submit">Save gallery</button></form></section>
+<section id="memberships" class="admin-panel editor" {panel_visibility['memberships']}><h2>Edit memberships</h2><p class="muted">Changes are saved and shown on the website pricing section.</p>{saved_notice}{error_notice}
 <form action="/admin/memberships" method="post"><label>Section title<input name="title" maxlength="80" value="{html.escape(settings['title'], quote=True)}" required></label>
 <label>Section description<input name="description" maxlength="240" value="{html.escape(settings['description'], quote=True)}"></label>{plan_editors}
 <button type="submit">Save memberships</button></form></section></main></div></body></html>""", status)
@@ -620,6 +848,10 @@ body{padding:0}
 .sidebar-bottom{margin-top:auto;display:grid;gap:16px;padding:12px 8px 4px}.sidebar-bottom>a{text-decoration:none;font-size:14px}.sidebar-bottom form{margin:0}.sidebar-bottom button{width:100%}
 .admin-main{min-width:0;max-width:1500px;width:100%;padding:38px clamp(22px,4vw,64px) 64px;margin:0 auto}
 .admin-main>header{margin:0 0 26px}.admin-main h1{font-size:30px}.admin-main h2{margin:0;font-size:22px}
+.admin-panel[hidden]{display:none!important}
+.admin-panel-active>.section-title{margin-top:0}
+.theme-shortcut{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:8px;background:var(--blue);color:#fff;text-decoration:none;font-weight:650;white-space:nowrap}
+.theme-editor{margin:0 0 28px!important}
 .admin-main .breadcrumb{margin:0 0 6px}.admin-main header p:last-child,.section-title p:last-child{margin-bottom:0}
 .summary-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:0 0 38px}
 .summary-cards article{padding:20px;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:grid;gap:10px}
@@ -627,6 +859,15 @@ body{padding:0}
 .admin-section{margin:0 0 34px}.section-title{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}
 .count-pill{padding:5px 10px;border-radius:999px;background:#20242c;color:var(--muted);font-size:12px;white-space:nowrap}
 .admin-main .editor{margin-top:28px}.admin-main .editor h2{margin:0}
+.theme-color-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:20px 0 24px}
+.color-field{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0;padding:12px 14px;background:#0c0d0f;border:1px solid var(--line);border-radius:10px;color:var(--muted);font-size:14px}
+.color-field input[type=color]{width:54px;height:40px;margin:0;padding:3px;border:1px solid var(--line);border-radius:8px;background:#0c0d0f;cursor:pointer}
+.gallery-admin-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:20px 0 24px}
+.gallery-editor-card input[type=file]{padding:8px;font-size:13px}
+.gallery-editor-card{min-width:0;margin:0!important;padding:14px!important;background:#0c0d0f}
+.gallery-editor-card legend{color:var(--text)}
+.gallery-preview{width:100%;height:150px;object-fit:cover;border-radius:8px;border:1px solid var(--line);background:#08090b}
+.gallery-empty{display:grid;place-items:center;color:var(--muted);font-size:13px}
 @media(max-width:760px){body{padding:0}.admin-shell{grid-template-columns:1fr}.sidebar{position:relative;height:auto;padding:16px;border-right:0;border-bottom:1px solid var(--line)}.admin-brand{padding:0 4px 16px}.nav-label{padding:0 4px}.admin-nav{grid-template-columns:repeat(2,minmax(0,1fr))}.sidebar-bottom{grid-template-columns:1fr 1fr;align-items:center;margin-top:14px;padding:8px 4px 0}.admin-main{padding:26px 16px 48px}.summary-cards{gap:10px}.summary-cards article{padding:14px}.summary-cards strong{font-size:23px}}
 @media(max-width:460px){.summary-cards{grid-template-columns:1fr}.summary-cards article{display:flex;justify-content:space-between;align-items:center}.section-title{align-items:flex-start}.admin-nav{grid-template-columns:1fr 1fr}}
 """

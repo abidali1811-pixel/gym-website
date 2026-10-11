@@ -10,7 +10,7 @@ The forms and chatbot need the Python server. For the chatbot, set `CHAT_PROVIDE
 python server.py
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) to view the site. Visit [http://127.0.0.1:8000/admin](http://127.0.0.1:8000/admin) and sign in with username `admin` and the password you set. The admin dashboard sidebar links to the overview, contact requests, homepage banner, and memberships. Edit the banner text, button, and optional HTTPS image URL, plus membership names, prices, and features; save to publish changes. You can override the username with the `ADMIN_USERNAME` environment variable.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) to view the site. Visit [http://127.0.0.1:8000/admin](http://127.0.0.1:8000/admin) and sign in with username `admin` and the password you set. The admin dashboard sidebar links to contact requests, the homepage banner, color theme, gym gallery, and memberships. Update theme colors and gallery photos with HTTPS URLs or JPG, PNG, and WebP uploads (up to 5 MB each), or edit the banner text, button, and optional HTTPS image URL; save to publish changes. Uploaded photos are stored in `uploads/gallery/`. You can override the username with the `ADMIN_USERNAME` environment variable.
 
 Membership prices are shown in Indian rupees (INR, ₹); the amount values remain editable in the admin panel.
 
