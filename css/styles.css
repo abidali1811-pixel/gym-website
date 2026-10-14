@@ -503,6 +503,48 @@ a:hover {
   text-align: center;
 }
 
+.captcha-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.captcha-prompt {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.captcha-code {
+  display: inline-block;
+  min-width: 8.5rem;
+  padding: 0.7rem 1rem;
+  border: 2px solid var(--accent);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 18%);
+  color: #151515;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-align: center;
+}
+
+.captcha-refresh {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.captcha-refresh:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 .captcha-help {
   display: block;
   margin-top: -0.65rem;

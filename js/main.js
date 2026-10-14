@@ -73,6 +73,36 @@
   }
 
   const formStatus = document.getElementById("form-status");
+  const captchaRefresh = document.getElementById("captcha-refresh");
+  if (captchaRefresh) {
+    captchaRefresh.addEventListener("click", async () => {
+      const code = document.getElementById("captcha-code");
+      const token = document.querySelector('.contact-form input[name="captcha_token"]');
+      const answer = document.querySelector('.contact-form input[name="captcha_answer"]');
+      const help = document.getElementById("captcha-help");
+      captchaRefresh.disabled = true;
+      try {
+        const response = await fetch("/captcha", {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { Accept: "application/json" }
+        });
+        if (!response.ok) throw new Error("Captcha refresh failed");
+        const captcha = await response.json();
+        if (!captcha.challenge || !captcha.token) throw new Error("Invalid captcha response");
+        code.textContent = captcha.challenge;
+        token.value = captcha.token;
+        answer.value = "";
+        if (help) help.textContent = "Enter all 6 characters. You can refresh the code if needed.";
+        answer.focus();
+      } catch {
+        if (help) help.textContent = "Could not refresh the code. Please reload the page and try again.";
+      } finally {
+        captchaRefresh.disabled = false;
+      }
+    });
+  }
   const phoneInput = document.querySelector('.contact-form input[name="phone"]');
   if (phoneInput) {
     const phoneError = document.getElementById("phone-error");
