@@ -503,6 +503,13 @@ a:hover {
   text-align: center;
 }
 
+.captcha-help {
+  display: block;
+  margin-top: -0.65rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 .form-success {
   color: #78b6ff;
 }

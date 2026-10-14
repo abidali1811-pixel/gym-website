@@ -56,6 +56,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 CHATBOT_KNOWLEDGE = os.path.join(ROOT, "chatbot_knowledge.json")
 SESSION_LIFETIME = timedelta(hours=12)
+CAPTCHA_LIFETIME = timedelta(minutes=15)
 INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DATABASE_ERRORS = (sqlite3.Error,) + ((psycopg.Error,) if psycopg is not None else ())
@@ -558,10 +559,42 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         age = datetime.now(timezone.utc) - issued
         return age >= timedelta(0) and age < SESSION_LIFETIME and hmac.compare_digest(signature, expected)
 
+    def new_captcha(self):
+        first = secrets.randbelow(9) + 1
+        second = secrets.randbelow(9) + 1
+        timestamp = str(int(time.time()))
+        payload = f"{timestamp}.{first}.{second}"
+        signature = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return first, second, f"{payload}.{signature}"
+
+    def verify_captcha(self, token, answer):
+        try:
+            timestamp, first, second, signature = token.split(".", 3)
+            issued = datetime.fromtimestamp(int(timestamp), timezone.utc)
+            first_number = int(first)
+            second_number = int(second)
+            submitted_answer = int(answer)
+        except (ValueError, OverflowError):
+            return False
+        payload = f"{timestamp}.{first}.{second}"
+        expected = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        age = datetime.now(timezone.utc) - issued
+        return (
+            1 <= first_number <= 9 and 1 <= second_number <= 9
+            and age >= timedelta(0) and age < CAPTCHA_LIFETIME
+            and hmac.compare_digest(signature, expected)
+            and submitted_answer == first_number + second_number
+        )
+
     def save_visit(self):
         fields = self.read_form()
         if fields is None:
             self.send_error(400, "Invalid form submission")
+            return
+        captcha_answer = fields.get("captcha_answer", [""])[0].strip()
+        captcha_token = fields.get("captcha_token", [""])[0]
+        if not self.verify_captcha(captcha_token, captcha_answer):
+            self.redirect("/?form_error=captcha#contact")
             return
         name = fields.get("name", [""])[0].strip()
         email = fields.get("email", [""])[0].strip()
@@ -757,6 +790,15 @@ class WebsiteHandler(SimpleHTTPRequestHandler):
         )
         content = content.replace("<!-- MEMBERSHIP_HEADER -->", section_header)
         content = content.replace("<!-- MEMBERSHIP_CARDS -->", "\n".join(cards))
+        first, second, token = self.new_captcha()
+        captcha_markup = (
+            f'<label>Security check: what is {first} + {second}?'
+            f'<input type="number" name="captcha_answer" min="0" max="18" inputmode="numeric" '
+            f'required autocomplete="off" aria-describedby="captcha-help"></label>'
+            f'<input type="hidden" name="captcha_token" value="{html.escape(token, quote=True)}">'
+            '<small class="captcha-help" id="captcha-help">Enter the sum to send your request.</small>'
+        )
+        content = content.replace("<!-- CONTACT_CAPTCHA -->", captcha_markup)
         gallery_cards = []
         for image in gallery:
             if not image["image_url"]:

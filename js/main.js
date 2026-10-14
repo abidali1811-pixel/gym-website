@@ -130,6 +130,9 @@
   } else if (formStatus && formParams.get("form_error") === "invalid") {
     formStatus.textContent = "Please check your name and email, and enter exactly 10 mobile digits.";
     formStatus.classList.add("form-error");
+  } else if (formStatus && formParams.get("form_error") === "captcha") {
+    formStatus.textContent = "The security check was incorrect or expired. Please try again.";
+    formStatus.classList.add("form-error");
   }
 
   if (toggle && nav) {
